@@ -1,0 +1,51 @@
+# Linux remote builder for running the NixOS VM tests from a mac.
+#
+#   limactl create --name=nixbuilder ops/lima-nixbuilder.yaml && limactl start nixbuilder
+#
+# vz plus nestedVirtualization is the part that matters: the NixOS test driver
+# boots its own QEMU guests inside this one, and without /dev/kvm in here they
+# fall back to software emulation. Needs an M3 or newer host.
+vmType: "vz"
+nestedVirtualization: true
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+cpus: 6
+memory: "8GiB"
+disk: "80GiB"
+
+mounts: []
+
+ssh:
+  localPort: 31022
+  loadDotSSHPubKeys: false
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      test -e /dev/kvm
+      groupadd -f kvm
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      command -v nix >/dev/null && exit 0
+      curl --proto '=https' --tlsv1.2 -sSf -L \
+        https://install.determinate.systems/nix | sh -s -- install linux --no-confirm
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      id builder >/dev/null 2>&1 || useradd -m -s /bin/bash builder
+      usermod -aG kvm builder
+      install -d -m 700 -o builder -g builder /home/builder/.ssh
+      grep -q 'trusted-users' /etc/nix/nix.custom.conf 2>/dev/null || {
+        echo 'trusted-users = root builder' >> /etc/nix/nix.custom.conf
+        echo 'system-features = nixos-test benchmark big-parallel kvm' \
+          >> /etc/nix/nix.custom.conf
+      }
+      systemctl restart nix-daemon.service
