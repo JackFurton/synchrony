@@ -49,8 +49,10 @@ pkgs.testers.runNixOSTest {
     node3.fail("ping -c1 -W2 node1")
     node3.succeed("ping -c1 -W2 node2")
 
+    # origin is the node that spoke, hops is how many relayed it on, so this
+    # asserts both that node3 was heard and that it took the long way round.
     source.wait_until_succeeds(
-        "journalctl -u synchrony-node | grep -q 'path=node3>node2>node1'"
+        "journalctl -u synchrony-node | grep -q 'origin=node3 hops=2'"
     )
   '';
 }

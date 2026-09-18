@@ -1,6 +1,7 @@
 #include "net.hpp"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -57,18 +58,10 @@ int dial(const std::string& host, std::uint16_t port) {
   return fd;
 }
 
-bool write_all(int fd, const void* data, std::size_t len) {
-  const auto* p = static_cast<const unsigned char*>(data);
-  while (len > 0) {
-    const ssize_t n = ::write(fd, p, len);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      return false;
-    }
-    p += n;
-    len -= static_cast<std::size_t>(n);
-  }
-  return true;
+int set_nonblocking(int fd) {
+  const int flags = ::fcntl(fd, F_GETFL, 0);
+  if (flags < 0) return -1;
+  return ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
 }  // namespace sy

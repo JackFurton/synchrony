@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "net.hpp"
+#include "peer.hpp"
 #include "wire.hpp"
 
 namespace {
@@ -26,6 +27,12 @@ struct Config {
 void log(const Config& cfg, const std::string& msg) {
   std::printf("[%s] %s\n", cfg.id.c_str(), msg.c_str());
   std::fflush(stdout);
+}
+
+std::string describe(const sy::Message& m) {
+  return std::string(sy::to_string(m.type)) + " origin=" + m.origin +
+         " hops=" + std::to_string(m.hops) + " seq=" + std::to_string(m.seq) +
+         " payload=" + m.payload;
 }
 
 bool parse_args(int argc, char** argv, Config& cfg) {
@@ -79,7 +86,10 @@ int main(int argc, char** argv) {
   }
   log(cfg, "listening on port " + std::to_string(cfg.listen_port));
 
+  std::map<int, sy::Peer> peers;
   int upstream_fd = -1;
+  std::uint32_t next_seq = 0;
+
   if (!cfg.upstream_host.empty()) {
     upstream_fd = dial_upstream(cfg, 30);
     if (upstream_fd < 0) {
@@ -87,21 +97,37 @@ int main(int argc, char** argv) {
                    cfg.upstream_host.c_str(), cfg.upstream_port);
       return 1;
     }
+    sy::set_nonblocking(upstream_fd);
+    peers.emplace(upstream_fd, sy::Peer(upstream_fd));
     log(cfg, "upstream connected: " + cfg.upstream_host + ":" +
                  std::to_string(cfg.upstream_port));
 
-    const auto frame = sy::encode_frame("hello path=" + cfg.id);
-    sy::write_all(upstream_fd, frame.data(), frame.size());
+    sy::Message hello;
+    hello.type = sy::MsgType::Hello;
+    hello.origin = cfg.id;
+    hello.seq = next_seq++;
+    hello.payload = "hello";
+    peers.at(upstream_fd).queue(sy::encode(hello));
   } else {
     log(cfg, "no upstream, acting as source");
   }
 
-  std::map<int, std::vector<std::uint8_t>> peers;  // fd -> unconsumed bytes
+  const auto drop = [&](int fd, const char* why) {
+    log(cfg, std::string("dropping peer: ") + why);
+    ::close(fd);
+    peers.erase(fd);
+    if (fd == upstream_fd) upstream_fd = -1;
+  };
 
   for (;;) {
     std::vector<pollfd> pfds;
     pfds.push_back({listen_fd, POLLIN, 0});
-    for (const auto& [fd, _] : peers) pfds.push_back({fd, POLLIN, 0});
+    for (auto& [fd, peer] : peers) {
+      pfds.push_back({fd, static_cast<short>(POLLIN | (peer.wants_write()
+                                                           ? POLLOUT
+                                                           : 0)),
+                      0});
+    }
 
     if (::poll(pfds.data(), pfds.size(), -1) < 0) {
       if (errno == EINTR) continue;
@@ -112,38 +138,67 @@ int main(int argc, char** argv) {
     if (pfds[0].revents & POLLIN) {
       const int fd = ::accept(listen_fd, nullptr, nullptr);
       if (fd >= 0) {
-        peers.emplace(fd, std::vector<std::uint8_t>{});
+        sy::set_nonblocking(fd);
+        peers.emplace(fd, sy::Peer(fd));
         log(cfg, "downstream connected");
       }
     }
 
     for (std::size_t i = 1; i < pfds.size(); ++i) {
-      if (!(pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
       const int fd = pfds[i].fd;
+      const auto it = peers.find(fd);
+      if (it == peers.end()) continue;
+      sy::Peer& peer = it->second;
 
-      std::uint8_t chunk[4096];
-      const ssize_t n = ::read(fd, chunk, sizeof(chunk));
-      if (n <= 0) {
-        log(cfg, "downstream closed");
-        ::close(fd);
-        peers.erase(fd);
+      if (pfds[i].revents & POLLOUT) {
+        if (!peer.flush()) {
+          drop(fd, "write failed");
+          continue;
+        }
+      }
+
+      if (!(pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+
+      if (!peer.fill()) {
+        drop(fd, "closed");
         continue;
       }
 
-      auto& buf = peers[fd];
-      buf.insert(buf.end(), chunk, chunk + n);
+      bool fatal = false;
+      for (;;) {
+        sy::Message msg;
+        const sy::Decoded status = sy::decode(peer.inbound(), msg);
+        if (status == sy::Decoded::Incomplete) break;
+        if (status == sy::Decoded::Malformed) {
+          fatal = true;
+          break;
+        }
 
-      std::string payload;
-      while (sy::decode_frame(buf, payload)) {
-        log(cfg, "recv: " + payload);
-        if (upstream_fd >= 0) {
-          const auto frame = sy::encode_frame(payload + ">" + cfg.id);
-          sy::write_all(upstream_fd, frame.data(), frame.size());
-          log(cfg, "forwarded upstream");
-        } else {
-          log(cfg, "delivered at source: " + payload);
+        log(cfg, "recv " + describe(msg));
+
+        if (upstream_fd < 0) {
+          log(cfg, "delivered at source: " + describe(msg));
+          continue;
+        }
+
+        if (msg.hops >= sy::kMaxHops) {
+          log(cfg, "hop limit reached, dropping " + describe(msg));
+          continue;
+        }
+
+        ++msg.hops;
+        sy::Peer& up = peers.at(upstream_fd);
+        if (!up.queue(sy::encode(msg))) {
+          log(cfg, "upstream buffer full, dropped " + describe(msg));
+          continue;
+        }
+        if (!up.flush()) {
+          drop(upstream_fd, "write failed");
+          break;
         }
       }
+
+      if (fatal) drop(fd, "malformed frame");
     }
   }
 }
