@@ -41,6 +41,12 @@ pkgs.testers.runNixOSTest {
   };
 
   testScript = ''
+    import time
+
+    # Each guest keeps its own CLOCK_REALTIME and nothing syncs them, so the
+    # nodes start hundreds of milliseconds apart. That constant is invisible to
+    # Cristian's algorithm and to us, so every assertion below is about how much
+    # an estimate MOVES when the network changes, never its absolute value.
     def last_offset_us(m):
         out = m.succeed(
             "journalctl -u synchrony-node -o cat "
@@ -49,14 +55,20 @@ pkgs.testers.runNixOSTest {
         return int(out.strip().split("=")[1])
 
 
-    def wait_for_offset(m, lo_us, hi_us):
-        def settled(_):
-            try:
-                return lo_us <= last_offset_us(m) <= hi_us
-            except Exception:
-                return False
+    def settled_offset_us(m, tol_us=3000, tries=40):
+        prev = None
+        for _ in range(tries):
+            time.sleep(1)
+            v = last_offset_us(m)
+            if prev is not None and abs(v - prev) <= tol_us:
+                return v
+            prev = v
+        raise Exception(f"{m.name} offset never settled, last was {prev}")
 
-        retry(settled)
+
+    def netem(m, dev, ms, first=False):
+        verb = "add" if first else "change"
+        m.succeed(f"tc qdisc {verb} dev {dev} root netem delay {ms}ms")
 
 
     start_all()
@@ -75,33 +87,52 @@ pkgs.testers.runNixOSTest {
         "journalctl -u synchrony-node | grep -q 'origin=node3 hops=2'"
     )
 
-    with subtest("a symmetric link syncs to within a millisecond"):
-        for m in (node1, node2, node3):
-            wait_for_offset(m, -5000, 5000)
+    relays = (node1, node2, node3)
 
-    # Now make every link lopsided in the same direction: 10ms towards the
-    # source, 50ms coming back. Cristian's algorithm splits the 60ms round trip
-    # down the middle, so every hop believes it is 20ms off, and each one
+    # One row per direction of travel, with the delay each gets in the
+    # asymmetric phase: 10ms heading towards the source, 50ms coming back.
+    links = (
+        (source, "eth1", 50),  # source -> node1
+        (node1, "eth1", 10),   # node1  -> source
+        (node1, "eth2", 50),   # node1  -> node2
+        (node2, "eth1", 10),   # node2  -> node1
+        (node2, "eth2", 50),   # node2  -> node3
+        (node3, "eth1", 10),   # node3  -> node2
+    )
+
+    with subtest("estimates converge on an idle network"):
+        base = {m.name: settled_offset_us(m) for m in relays}
+        print("baseline offsets (us): " + repr(base))
+
+    with subtest("symmetric delay does not move the estimate"):
+        for m, dev, _ in links:
+            netem(m, dev, 30, first=True)
+
+        for m in relays:
+            moved = settled_offset_us(m) - base[m.name]
+            assert abs(moved) < 6000, (
+                f"{m.name} moved {moved}us under symmetric delay, "
+                "which should cancel"
+            )
+
+    # 10ms towards the source, 50ms coming back. Cristian's splits the 60ms
+    # round trip down the middle, so each hop is wrong by (10 - 50) / 2 and
     # inherits its upstream's error on top of its own.
     with subtest("asymmetric delay stacks one hop at a time"):
-        source.succeed("tc qdisc add dev eth1 root netem delay 50ms")
-        node1.succeed("tc qdisc add dev eth1 root netem delay 10ms")
-        node1.succeed("tc qdisc add dev eth2 root netem delay 50ms")
-        node2.succeed("tc qdisc add dev eth1 root netem delay 10ms")
-        node2.succeed("tc qdisc add dev eth2 root netem delay 50ms")
-        node3.succeed("tc qdisc add dev eth1 root netem delay 10ms")
+        for m, dev, delay_ms in links:
+            netem(m, dev, delay_ms)
 
-        wait_for_offset(node1, -26000, -14000)
-        wait_for_offset(node2, -52000, -28000)
-        wait_for_offset(node3, -78000, -42000)
+        moved = {m.name: settled_offset_us(m) - base[m.name] for m in relays}
+        print("offset change under asymmetry (us): " + repr(moved))
 
-        measured = {m.name: last_offset_us(m) for m in (node1, node2, node3)}
-        print("measured offsets (us): " + repr(measured))
+        for name, expected in (("node1", -20000), ("node2", -40000),
+                               ("node3", -60000)):
+            assert abs(moved[name] - expected) < 9000, (
+                f"{name} moved {moved[name]}us, expected about {expected}us"
+            )
 
         assert (
-            abs(measured["node3"])
-            > abs(measured["node2"])
-            > abs(measured["node1"])
-        ), f"error did not grow with hop count: {measured}"
+            abs(moved["node3"]) > abs(moved["node2"]) > abs(moved["node1"])
+        ), f"error did not grow with hop count: {moved}"
   '';
 }
