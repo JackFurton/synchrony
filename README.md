@@ -32,8 +32,9 @@ $B --id node2  --listen 9002 --upstream 127.0.0.1:9001 &
 $B --id node3  --listen 9003 --upstream 127.0.0.1:9002 &
 ```
 
-source logs `delivered at source: hello path=node3>node2>node1`, which is the
-whole chain in one line.
+source logs `delivered at source: hello origin=node3 hops=2 seq=0
+payload=hello`, which is the whole chain in one line: node3 spoke, and two other
+nodes relayed it before it arrived.
 
 Loopback proves the code path but not the topology: nothing stops node3 dialling
 source directly. That is what the VM test is for.
