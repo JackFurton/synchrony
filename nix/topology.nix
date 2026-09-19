@@ -10,6 +10,8 @@ let
   node = { upstream ? null, vlans }: { config, ... }: {
     virtualisation.vlans = vlans;
     networking.firewall.allowedTCPPorts = [ port ];
+    environment.systemPackages = [ pkgs.iproute2 ];
+    boot.kernelModules = [ "sch_netem" ];
 
     systemd.services.synchrony-node = {
       wantedBy = [ "multi-user.target" ];
@@ -39,6 +41,24 @@ pkgs.testers.runNixOSTest {
   };
 
   testScript = ''
+    def last_offset_us(m):
+        out = m.succeed(
+            "journalctl -u synchrony-node -o cat "
+            "| grep -o 'offset_us=-\\?[0-9]*' | tail -1"
+        )
+        return int(out.strip().split("=")[1])
+
+
+    def wait_for_offset(m, lo_us, hi_us):
+        def settled(_):
+            try:
+                return lo_us <= last_offset_us(m) <= hi_us
+            except Exception:
+                return False
+
+        retry(settled)
+
+
     start_all()
 
     for m in (source, node1, node2, node3):
@@ -54,5 +74,34 @@ pkgs.testers.runNixOSTest {
     source.wait_until_succeeds(
         "journalctl -u synchrony-node | grep -q 'origin=node3 hops=2'"
     )
+
+    with subtest("a symmetric link syncs to within a millisecond"):
+        for m in (node1, node2, node3):
+            wait_for_offset(m, -5000, 5000)
+
+    # Now make every link lopsided in the same direction: 10ms towards the
+    # source, 50ms coming back. Cristian's algorithm splits the 60ms round trip
+    # down the middle, so every hop believes it is 20ms off, and each one
+    # inherits its upstream's error on top of its own.
+    with subtest("asymmetric delay stacks one hop at a time"):
+        source.succeed("tc qdisc add dev eth1 root netem delay 50ms")
+        node1.succeed("tc qdisc add dev eth1 root netem delay 10ms")
+        node1.succeed("tc qdisc add dev eth2 root netem delay 50ms")
+        node2.succeed("tc qdisc add dev eth1 root netem delay 10ms")
+        node2.succeed("tc qdisc add dev eth2 root netem delay 50ms")
+        node3.succeed("tc qdisc add dev eth1 root netem delay 10ms")
+
+        wait_for_offset(node1, -26000, -14000)
+        wait_for_offset(node2, -52000, -28000)
+        wait_for_offset(node3, -78000, -42000)
+
+        measured = {m.name: last_offset_us(m) for m in (node1, node2, node3)}
+        print("measured offsets (us): " + repr(measured))
+
+        assert (
+            abs(measured["node3"])
+            > abs(measured["node2"])
+            > abs(measured["node1"])
+        ), f"error did not grow with hop count: {measured}"
   '';
 }
