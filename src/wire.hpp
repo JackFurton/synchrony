@@ -31,6 +31,8 @@ constexpr std::uint8_t kMaxHops = 16;
 enum class MsgType : std::uint8_t {
   Hello = 1,
   Data = 2,
+  TimeReq = 3,
+  TimeResp = 4,
 };
 
 struct Message {
@@ -53,5 +55,10 @@ enum class Decoded {
 Decoded decode(std::vector<std::uint8_t>& buf, Message& out);
 
 const char* to_string(MsgType type);
+
+// Payload bodies for the time messages. Kept out of the header so the header
+// stays the same size for every message type.
+std::string encode_i64(std::int64_t v);
+bool decode_i64(const std::string& payload, std::int64_t& out);
 
 }  // namespace sy

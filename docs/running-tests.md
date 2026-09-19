@@ -65,8 +65,15 @@ inside the VM against a pushed branch, which is useful for a quick check:
 
 ```sh
 limactl shell nixbuilder \
-  nix build "github:JackFurton/synchrony/main#checks.aarch64-linux.topology" -L
+  nix build --refresh \
+    "github:JackFurton/synchrony/main#checks.aarch64-linux.topology" -L
 ```
+
+`--refresh` is not optional. Nix caches what a `github:` ref resolves to for an
+hour, so without it you re-test whatever revision you ran last time and the
+failure you get back belongs to code you have already replaced. Check with
+`nix flake metadata github:JackFurton/synchrony/main` if a result looks like it
+is answering the wrong question.
 
 ## Determinate's Native Linux Builder
 
