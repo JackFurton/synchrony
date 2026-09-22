@@ -22,6 +22,9 @@ sy::Message sample() {
   m.type = sy::MsgType::Hello;
   m.hops = 2;
   m.seq = 70000;  // wider than 16 bits, so a truncated seq field shows up
+  // Both halves of the wall time non-zero and the top bit of logical set, so a
+  // field that is truncated, swapped or sign-mangled shows up.
+  m.hlc = {0x0123456789ABCDEFLL, 0x80000001u};
   m.origin = "node3";
   m.payload = "hello";
   return m;
@@ -36,9 +39,20 @@ void round_trip() {
   CHECK(out.type == in.type);
   CHECK(out.hops == in.hops);
   CHECK(out.seq == in.seq);
+  CHECK(out.hlc == in.hlc);
   CHECK(out.origin == in.origin);
   CHECK(out.payload == in.payload);
   CHECK(buf.empty());
+}
+
+void negative_wall_time_survives() {
+  sy::Message in = sample();
+  in.hlc = {-5, 0};
+  auto buf = sy::encode(in);
+
+  sy::Message out;
+  CHECK(sy::decode(buf, out) == sy::Decoded::Ok);
+  CHECK(out.hlc.wall == -5);
 }
 
 void empty_fields() {
@@ -142,6 +156,7 @@ void empty_buffer() {
 
 int main() {
   round_trip();
+  negative_wall_time_survives();
   empty_fields();
   max_origin();
   split_reads();
