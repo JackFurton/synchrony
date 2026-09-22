@@ -22,8 +22,8 @@ std::uint32_t get_u32(const std::uint8_t* p) {
 constexpr std::size_t kHeader = 8;  // everything after the length field
 
 bool known_type(std::uint8_t t) {
-  return t == static_cast<std::uint8_t>(MsgType::Hello) ||
-         t == static_cast<std::uint8_t>(MsgType::Data);
+  return t >= static_cast<std::uint8_t>(MsgType::Hello) &&
+         t <= static_cast<std::uint8_t>(MsgType::TimeResp);
 }
 
 }  // namespace
@@ -70,10 +70,32 @@ Decoded decode(std::vector<std::uint8_t>& buf, Message& out) {
   return Decoded::Ok;
 }
 
+std::string encode_i64(std::int64_t v) {
+  const auto u = static_cast<std::uint64_t>(v);
+  std::string out(8, '\0');
+  for (int i = 0; i < 8; ++i) {
+    out[static_cast<std::size_t>(i)] =
+        static_cast<char>((u >> (56 - 8 * i)) & 0xFF);
+  }
+  return out;
+}
+
+bool decode_i64(const std::string& payload, std::int64_t& out) {
+  if (payload.size() != 8) return false;
+  std::uint64_t u = 0;
+  for (std::size_t i = 0; i < 8; ++i) {
+    u = (u << 8) | static_cast<std::uint8_t>(payload[i]);
+  }
+  out = static_cast<std::int64_t>(u);
+  return true;
+}
+
 const char* to_string(MsgType type) {
   switch (type) {
     case MsgType::Hello: return "hello";
     case MsgType::Data: return "data";
+    case MsgType::TimeReq: return "time_req";
+    case MsgType::TimeResp: return "time_resp";
   }
   return "unknown";
 }
