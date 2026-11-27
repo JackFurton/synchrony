@@ -20,7 +20,7 @@ let
     services.nginx = {
       enable = true;
       commonHttpConfig = ''
-        log_format cache '$request_method $uri $status $upstream_cache_status $body_bytes_sent';
+        log_format cache '$request_method $uri $status $upstream_cache_status $body_bytes_sent $request_time $upstream_response_time len=$upstream_http_content_length te=$upstream_http_transfer_encoding';
         proxy_cache_path /var/cache/nginx/nix keys_zone=nix:10m max_size=1g inactive=1d use_temp_path=off;
       '';
       virtualHosts.cache = {
@@ -381,6 +381,9 @@ pkgs.testers.runNixOSTest {
         warm = time.monotonic() - start
         print(f"node3 through two caches: {cold:.2f}s, "
               f"node2 from node1's copy: {warm:.2f}s")
+
+        for m in (source, node1, node2):
+            print(m.name + ":\n" + m.succeed("cat /var/log/nginx/cache.log"))
 
         def sha(m):
             return m.succeed(f"sha256sum {path}").split()[0]
