@@ -14,13 +14,26 @@ let
   # path built on source reaches node3 by being pulled through node2 and node1,
   # each keeping a copy on the way past. nix-serve alone could not do that: it
   # serves its own store and answers 404 for anything it has not got.
-  cache = upstream: { lib, ... }: {
+  cache = { upstream, vlans }: { lib, nodes, ... }:
+    let
+      # By address, not name. A name resolves to every address the node has,
+      # one per vlan, and nginx tries each in turn: node2 sat out the 60s
+      # connect timeout on node1's vlan1 address before trying the right one.
+      upstreamUrl =
+        let
+          up = nodes.${upstream};
+          shared = builtins.head (lib.intersectLists vlans up.virtualisation.vlans);
+          eth = "eth${toString (lib.lists.findFirstIndex (v: v == shared) null up.virtualisation.vlans + 1)}";
+        in
+        "http://${(builtins.head up.networking.interfaces.${eth}.ipv4.addresses).address}:${toString cachePort}";
+    in
+    {
     networking.firewall.allowedTCPPorts = [ cachePort ];
 
     services.nginx = {
       enable = true;
       commonHttpConfig = ''
-        log_format cache '$request_method $uri $status $upstream_cache_status $body_bytes_sent $request_time $upstream_response_time len=$upstream_http_content_length te=$upstream_http_transfer_encoding';
+        log_format cache '$request_method $uri $status $upstream_cache_status $body_bytes_sent $request_time';
         proxy_cache_path /var/cache/nginx/nix keys_zone=nix:10m max_size=1g inactive=1d use_temp_path=off;
       '';
       virtualHosts.cache = {
@@ -29,7 +42,7 @@ let
         locations."/" = {
           proxyPass =
             if upstream == null then "http://127.0.0.1:${toString (cachePort + 1)}"
-            else "http://${upstream}:${toString cachePort}";
+            else upstreamUrl;
           # Only 200s: a 404 cached while source was still building would hide
           # the path once it existed. And only one request per path goes
           # upstream however many arrive at once.
@@ -52,11 +65,11 @@ let
     systemd.services.nix-serve.wantedBy = lib.mkIf (upstream == null) (lib.mkForce [ ]);
 
     nix.settings.substituters =
-      lib.mkForce (lib.optional (upstream != null) "http://${upstream}:${toString cachePort}");
-  };
+      lib.mkForce (lib.optional (upstream != null) upstreamUrl);
+    };
 
   node = { upstream ? null, vlans }: { config, ... }: {
-    imports = [ (cache upstream) ];
+    imports = [ (cache { inherit upstream vlans; }) ];
     virtualisation.vlans = vlans;
     networking.firewall.allowedTCPPorts = [ port ];
     environment.systemPackages = [ pkgs.iproute2 pkgs.busybox synchrony ];
@@ -381,9 +394,6 @@ pkgs.testers.runNixOSTest {
         warm = time.monotonic() - start
         print(f"node3 through two caches: {cold:.2f}s, "
               f"node2 from node1's copy: {warm:.2f}s")
-
-        for m in (source, node1, node2):
-            print(m.name + ":\n" + m.succeed("cat /var/log/nginx/cache.log"))
 
         def sha(m):
             return m.succeed(f"sha256sum {path}").split()[0]
