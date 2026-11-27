@@ -88,6 +88,12 @@ pkgs.testers.runNixOSTest {
         return dict(kv.split("=", 1) for kv in out.split() if "=" in kv)
 
 
+    def count(m, pattern):
+        return int(m.succeed(
+            f"journalctl -u synchrony-node -o cat | grep -cE '{pattern}' || true"
+        ).strip())
+
+
     def netem(m, dev, ms, first=False):
         verb = "add" if first else "change"
         m.succeed(f"tc qdisc {verb} dev {dev} root netem delay {ms}ms")
@@ -141,7 +147,7 @@ pkgs.testers.runNixOSTest {
         node3.succeed("synchrony-put 127.0.0.1:${toString port} written=node3")
         source.wait_until_succeeds(
             "journalctl -u synchrony-node -o cat "
-            "| grep -q 'put key=written .* hops=3$'"
+            "| grep -q 'put key=written .* origin=node3 hops=2$'"
         )
         for m in relays:
             m.wait_until_succeeds(
@@ -231,5 +237,54 @@ pkgs.testers.runNixOSTest {
             assert step["hlc"][1] >= 1, (
                 f"{m.name} stepped back but hlc did not hold: {step}"
             )
+  
+    # node2 is node3's only way out. With it stopped, node3 has to keep taking
+    # writes with nowhere to send them, then hand them over to a node2 that
+    # comes back with an empty store and an unsynced clock.
+    with subtest("node3 keeps its writes while node2 is down"):
+        failed_dials = count(node3, "upstream dial failed")
+        drained = count(node3, "landed key=.* outbox=0$")
+        node2.succeed("systemctl stop synchrony-node")
+        node3.wait_until_succeeds(
+            f"[ $(journalctl -u synchrony-node -o cat "
+            f"| grep -c 'upstream dial failed') -gt {failed_dials} ]"
+        )
+
+        node3.succeed(
+            "synchrony-put 127.0.0.1:${toString port} "
+            + " ".join(f"outage{i}=v" for i in range(50))
+            + " clash=node3"
+        )
+        # Written after node3's, so it has to win even though node3's arrives
+        # later. Asymmetry has node3's clock running about 60ms behind source
+        # by now, which is the direction where LWW gets this right; ahead by
+        # more than the gap between the two writes and it would not.
+        source.succeed("synchrony-put 127.0.0.1:${toString port} clash=source")
+
+        time.sleep(5)
+        source.fail("journalctl -u synchrony-node -o cat | grep -q 'key=outage'")
+        node2.succeed("systemctl start synchrony-node")
+
+        source.wait_until_succeeds(
+            "journalctl -u synchrony-node -o cat "
+            "| grep -q 'put key=clash .* origin=node3 hops=2 stale$'"
+        )
+        node3.wait_until_succeeds(
+            f"[ $(journalctl -u synchrony-node -o cat "
+            f"| grep -c 'landed key=.* outbox=0$') -gt {drained} ]"
+        )
+
+        # 1001 from before, 50 outage keys and clash. node2 lost everything
+        # when it stopped, so it has to have refilled from node1.
+        for m in relays:
+            m.wait_until_succeeds(
+                "journalctl -u synchrony-node -o cat | grep -q 'keys=1052$'"
+            )
+
+        # The version was fixed when node3 accepted the write, not when source
+        # finally got it, so the lag covers the whole outage.
+        lag = int(log_fields(node3, "applied key=outage0 ")["lag_us"])
+        print(f"outage0 reached node3 {lag}us after node3 accepted it")
+        assert lag > 5_000_000, f"lag {lag}us is shorter than the outage"
   '';
 }

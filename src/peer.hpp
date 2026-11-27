@@ -7,8 +7,8 @@
 namespace sy {
 
 // Outbound bytes are buffered per peer so that one stalled link cannot stop the
-// poll loop serving the others. The cap is a placeholder: issue #7 replaces it
-// with a queue that survives the link being down.
+// poll loop serving the others. Nothing that has to survive the link going
+// down lives here: a node's own writes stay in its Outbox until they land.
 constexpr std::size_t kMaxOutbound = 1u << 20;
 
 class Peer {
