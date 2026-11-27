@@ -37,6 +37,17 @@ payload=hello`, which is the whole chain in one line: node3 spoke, and two other
 nodes relayed it before it arrived. The hlc is node3's hybrid logical clock at
 the moment it sent, carried through unchanged.
 
+Writes can go in at any node, but only source applies them:
+
+```sh
+./result/bin/synchrony-put 127.0.0.1:9003 colour=blue
+```
+
+node3 relays the put up the chain like any other message and source stamps it
+with its HLC. Then each node pulls it from its upstream with Merkle
+anti-entropy, one walk per hop, so node3 logs `applied key=colour ...
+lag_us=...` about three seconds later.
+
 Loopback proves the code path but not the topology: nothing stops node3 dialling
 source directly. That is what the VM test is for.
 

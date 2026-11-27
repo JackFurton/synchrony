@@ -37,6 +37,11 @@ enum class MsgType : std::uint8_t {
   Data = 2,
   TimeReq = 3,
   TimeResp = 4,
+  Put = 5,       // payload key=value; relayed to source, which applies it
+  TreeReq = 6,   // anti-entropy, see anti_entropy.hpp for the payloads
+  TreeResp = 7,
+  LeafReq = 8,
+  LeafResp = 9,
 };
 
 struct Message {

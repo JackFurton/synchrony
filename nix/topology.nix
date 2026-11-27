@@ -10,7 +10,7 @@ let
   node = { upstream ? null, vlans }: { config, ... }: {
     virtualisation.vlans = vlans;
     networking.firewall.allowedTCPPorts = [ port ];
-    environment.systemPackages = [ pkgs.iproute2 ];
+    environment.systemPackages = [ pkgs.iproute2 synchrony ];
     boot.kernelModules = [ "sch_netem" ];
 
     systemd.services.synchrony-node = {
@@ -81,6 +81,13 @@ pkgs.testers.runNixOSTest {
         return rows
 
 
+    def log_fields(m, pattern):
+        out = m.succeed(
+            f"journalctl -u synchrony-node -o cat | grep -E '{pattern}' | tail -1"
+        )
+        return dict(kv.split("=", 1) for kv in out.split() if "=" in kv)
+
+
     def netem(m, dev, ms, first=False):
         verb = "add" if first else "change"
         m.succeed(f"tc qdisc {verb} dev {dev} root netem delay {ms}ms")
@@ -118,6 +125,53 @@ pkgs.testers.runNixOSTest {
     with subtest("estimates converge on an idle network"):
         base = {m.name: settled_offset_us(m) for m in relays}
         print("baseline offsets (us): " + repr(base))
+
+    # Only source applies writes, and each node pulls only from its upstream,
+    # so a write made at node3 has to climb three hops to be applied and then
+    # come back down one anti-entropy walk per hop.
+    with subtest("a write at node3 goes up to source and back down"):
+        source.succeed(
+            "synchrony-put 127.0.0.1:${toString port} "
+            + " ".join(f"k{i}=v" for i in range(1000))
+        )
+        node3.wait_until_succeeds(
+            "journalctl -u synchrony-node -o cat | grep -q 'keys=1000$'"
+        )
+
+        node3.succeed("synchrony-put 127.0.0.1:${toString port} written=node3")
+        source.wait_until_succeeds(
+            "journalctl -u synchrony-node -o cat "
+            "| grep -q 'put key=written .* hops=3$'"
+        )
+        for m in relays:
+            m.wait_until_succeeds(
+                "journalctl -u synchrony-node -o cat "
+                "| grep -q 'applied key=written '"
+            )
+
+        # Read off each node's corrected clock against source's stamp, which
+        # on an idle network is good to well under a millisecond.
+        lag = {m.name: int(log_fields(m, "applied key=written ")["lag_us"])
+               for m in relays}
+        print("propagation lag from source (us): " + repr(lag))
+        assert lag["node1"] < lag["node2"] < lag["node3"], (
+            f"write did not arrive in hop order: {lag}"
+        )
+
+    # The point of the tree: with 1000 keys already in sync, the walk that
+    # carried that one write compared a single branch of hashes, not the store.
+    with subtest("one changed key costs one branch, not the dataset"):
+        for m in relays:
+            first = log_fields(m, "anti-entropy .* keys=1000$")
+            one = log_fields(m, "anti-entropy .* keys=1001$")
+            print(f"{m.name}: first sync {first['bytes']} bytes, "
+                  f"one key {one['bytes']} bytes, {one['hashes']} hashes")
+            assert int(one["applied"]) == 1, f"{m.name}: {one}"
+            assert int(one["hashes"]) == 1 + 16 * 3, f"{m.name}: {one}"
+            assert int(one["bytes"]) * 50 < int(first["bytes"]), (
+                f"{m.name}: one key cost {one['bytes']} bytes against "
+                f"{first['bytes']} for the whole store"
+            )
 
     with subtest("symmetric delay does not move the estimate"):
         for m, dev, _ in links:

@@ -10,18 +10,22 @@
 #include <cstring>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "anti_entropy.hpp"
 #include "clock.hpp"
 #include "hlc.hpp"
 #include "net.hpp"
 #include "peer.hpp"
+#include "store.hpp"
 #include "wire.hpp"
 
 namespace {
 
 constexpr std::int64_t kSyncIntervalNs = 500'000'000;
 constexpr std::int64_t kSyncTimeoutNs = 4'000'000'000;
+constexpr std::int64_t kWalkIntervalNs = 1'000'000'000;
 constexpr int kPollTimeoutMs = 100;
 
 struct Config {
@@ -80,6 +84,13 @@ struct Pending {
   std::int64_t t1 = 0;
 };
 
+struct Walking {
+  bool active = false;
+  std::uint32_t seq = 0;  // shared by every request in one walk
+  std::int64_t started = 0;
+  sy::Walk walk;
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -102,10 +113,13 @@ int main(int argc, char** argv) {
   std::map<int, sy::Peer> peers;
   sy::Clock clock;
   sy::HlcClock hlc;
+  sy::Store store;
   Pending pending;
+  Walking walking;
   int upstream_fd = -1;
   std::uint32_t next_seq = 0;
   std::int64_t last_sync = 0;
+  std::int64_t last_walk = 0;
 
   if (!cfg.upstream_host.empty()) {
     upstream_fd = dial_upstream(cfg, 30);
@@ -137,6 +151,7 @@ int main(int argc, char** argv) {
     if (fd == upstream_fd) {
       upstream_fd = -1;
       pending.active = false;
+      walking.active = false;
     }
   };
 
@@ -148,6 +163,33 @@ int main(int argc, char** argv) {
       return;
     }
     if (!it->second.flush()) drop(fd, "write failed");
+  };
+
+  // False if sending lost the peer, so the caller stops reading from it.
+  const auto reply = [&](int fd, sy::MsgType type, std::uint32_t seq,
+                         std::string payload) {
+    sy::Message resp;
+    resp.type = type;
+    resp.origin = cfg.id;
+    resp.seq = seq;  // echoed, so the asker can match it
+    resp.payload = std::move(payload);
+    resp.hlc = hlc.tick(clock.now());
+    send_to(fd, resp);
+    return peers.find(fd) != peers.end();
+  };
+
+  // False if sending lost upstream, which is usually the link the caller is
+  // in the middle of reading.
+  const auto send_walk = [&](const sy::Walk::Request& r) {
+    sy::Message req;
+    req.type = r.type;
+    req.origin = cfg.id;
+    req.seq = walking.seq;
+    req.payload = r.payload;
+    req.hlc = hlc.tick(clock.now());
+    const int fd = upstream_fd;
+    send_to(fd, req);
+    return peers.find(fd) != peers.end();
   };
 
   for (;;) {
@@ -185,6 +227,18 @@ int main(int argc, char** argv) {
       send_to(upstream_fd, req);
     }
 
+    if (walking.active && raw_now - walking.started > kSyncTimeoutNs) {
+      log(cfg, "anti-entropy timed out, will retry");
+      walking.active = false;
+    }
+
+    if (upstream_fd >= 0 && !walking.active &&
+        raw_now - last_walk >= kWalkIntervalNs) {
+      walking = {true, next_seq++, raw_now, sy::Walk{}};
+      last_walk = raw_now;
+      send_walk(walking.walk.start());
+    }
+
     if (pfds[0].revents & POLLIN) {
       const int fd = ::accept(listen_fd, nullptr, nullptr);
       if (fd >= 0) {
@@ -208,10 +262,9 @@ int main(int argc, char** argv) {
 
       if (!(pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
 
-      if (!it->second.fill()) {
-        drop(fd, "closed");
-        continue;
-      }
+      // A peer that writes and then closes hands over both in the same read,
+      // so whatever arrived before the close is decoded before acting on it.
+      const bool open = it->second.fill();
 
       bool fatal = false;
       bool gone = false;
@@ -227,16 +280,80 @@ int main(int argc, char** argv) {
         hlc.merge(msg.hlc, clock.now());
 
         if (msg.type == sy::MsgType::TimeReq) {
-          sy::Message resp;
-          resp.type = sy::MsgType::TimeResp;
-          resp.origin = cfg.id;
-          resp.seq = msg.seq;  // echoed, so the asker can match it
-          resp.payload = sy::encode_i64(clock.now());
-          resp.hlc = hlc.tick(clock.now());
-          send_to(fd, resp);
-          if (peers.find(fd) == peers.end()) {
+          if (!reply(fd, sy::MsgType::TimeResp, msg.seq,
+                     sy::encode_i64(clock.now()))) {
             gone = true;
             break;
+          }
+          continue;
+        }
+
+        if (msg.type == sy::MsgType::TreeReq ||
+            msg.type == sy::MsgType::LeafReq) {
+          const bool tree = msg.type == sy::MsgType::TreeReq;
+          std::string body;
+          if (!(tree ? sy::answer_tree(store, msg.payload, body)
+                     : sy::answer_leaves(store, msg.payload, body))) {
+            fatal = true;
+            break;
+          }
+          if (!reply(fd, tree ? sy::MsgType::TreeResp : sy::MsgType::LeafResp,
+                     msg.seq, std::move(body))) {
+            gone = true;
+            break;
+          }
+          continue;
+        }
+
+        if (msg.type == sy::MsgType::TreeResp ||
+            msg.type == sy::MsgType::LeafResp) {
+          if (!walking.active || fd != upstream_fd ||
+              msg.seq != walking.seq) {
+            log(cfg, std::string("unmatched ") + sy::to_string(msg.type) +
+                         " seq=" + std::to_string(msg.seq));
+            continue;
+          }
+
+          sy::Walk::Request next;
+          std::vector<std::string> applied;
+          const sy::Walk::Step step =
+              msg.type == sy::MsgType::TreeResp
+                  ? walking.walk.on_tree(store, msg.payload, next)
+                  : walking.walk.on_leaves(store, msg.payload, applied);
+
+          // lag is how long the write took to get here from source, read off
+          // this node's corrected clock against source's stamp, so it is only
+          // as good as the clock sync.
+          for (const auto& key : applied) {
+            const sy::Entry* e = store.get(key);
+            log(cfg, "applied key=" + key +
+                         " version=" + sy::to_string(e->version) +
+                         " lag_us=" +
+                         std::to_string((clock.now() - e->version.wall) / 1000));
+          }
+
+          if (step == sy::Walk::Step::Malformed) {
+            fatal = true;
+            break;
+          }
+          if (step == sy::Walk::Step::Next) {
+            if (!send_walk(next)) {
+              gone = true;
+              break;
+            }
+            continue;
+          }
+
+          walking.active = false;
+          const auto& st = walking.walk.stats();
+          if (st.round_trips > 1) {
+            log(cfg, "anti-entropy upstream=" + msg.origin +
+                         " round_trips=" + std::to_string(st.round_trips) +
+                         " hashes=" + std::to_string(st.hashes) +
+                         " entries=" + std::to_string(st.entries) +
+                         " applied=" + std::to_string(st.applied) +
+                         " bytes=" + std::to_string(st.bytes) +
+                         " keys=" + std::to_string(store.size()));
           }
           continue;
         }
@@ -277,6 +394,23 @@ int main(int argc, char** argv) {
 
         log(cfg, "recv " + describe(msg));
 
+        // Only source applies writes, so versions come from one clock and
+        // the newest version of a key is simply the latest write.
+        if (upstream_fd < 0 && msg.type == sy::MsgType::Put) {
+          const auto eq = msg.payload.find('=');
+          if (eq == 0 || eq == std::string::npos) {
+            log(cfg, "malformed put, dropping " + describe(msg));
+            continue;
+          }
+          const std::string key = msg.payload.substr(0, eq);
+          const sy::Entry e{msg.payload.substr(eq + 1), hlc.tick(clock.now())};
+          store.apply(key, e);
+          log(cfg, "put key=" + key + " version=" + sy::to_string(e.version) +
+                       " origin=" + msg.origin +
+                       " hops=" + std::to_string(msg.hops));
+          continue;
+        }
+
         if (upstream_fd < 0) {
           log(cfg, "delivered at source: " + describe(msg));
           continue;
@@ -291,7 +425,11 @@ int main(int argc, char** argv) {
       }
 
       if (gone) continue;
-      if (fatal) drop(fd, "malformed frame");
+      if (fatal) {
+        drop(fd, "malformed frame");
+      } else if (!open) {
+        drop(fd, "closed");
+      }
     }
   }
 }
