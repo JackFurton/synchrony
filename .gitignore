@@ -4,3 +4,4 @@ result-*
 .direnv/
 compile_commands.json
 .DS_Store
+.cache/
