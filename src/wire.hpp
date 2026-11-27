@@ -43,6 +43,8 @@ enum class MsgType : std::uint8_t {
   LeafReq = 8,
   LeafResp = 9,
   Delete = 10,   // payload key; travels and lands exactly like a put
+  Get = 11,      // answered from the local replica, see read.hpp
+  GetResp = 12,
 };
 
 struct Message {

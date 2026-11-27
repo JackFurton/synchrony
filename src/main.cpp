@@ -19,6 +19,7 @@
 #include "net.hpp"
 #include "outbox.hpp"
 #include "peer.hpp"
+#include "read.hpp"
 #include "store.hpp"
 #include "wire.hpp"
 
@@ -371,6 +372,23 @@ int main(int argc, char** argv) {
             gone = true;
             break;
           }
+          continue;
+        }
+
+        if (msg.type == sy::MsgType::Get) {
+          std::string body;
+          if (!sy::answer_get(store, clock.now(), msg.payload, body)) {
+            fatal = true;
+            break;
+          }
+          if (!reply(fd, sy::MsgType::GetResp, msg.seq, std::move(body))) {
+            gone = true;
+            break;
+          }
+          continue;
+        }
+        if (msg.type == sy::MsgType::GetResp) {
+          log(cfg, "unexpected get_resp from a peer, ignoring");
           continue;
         }
 

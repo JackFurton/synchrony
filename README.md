@@ -42,12 +42,14 @@ Writes can go in at any node, but only source applies them:
 ```sh
 ./result/bin/synchrony-put 127.0.0.1:9003 colour=blue
 ./result/bin/synchrony-put 127.0.0.1:9003 -d colour   # delete
+./result/bin/synchrony-get 127.0.0.1:9003 colour      # from node3's replica
 ```
 
 node3 relays the put up the chain like any other message and source stamps it
 with its HLC. Then each node pulls it from its upstream with Merkle
 anti-entropy, one walk per hop, so node3 logs `applied key=colour ...
-lag_us=...` about three seconds later.
+lag_us=...` about three seconds later. A read is answered by whichever node you
+ask, from its own copy, and says how far behind source that copy might be.
 
 Loopback proves the code path but not the topology: nothing stops node3 dialling
 source directly. That is what the VM test is for.
