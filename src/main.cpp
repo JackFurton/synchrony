@@ -121,6 +121,8 @@ int main(int argc, char** argv) {
   int connecting_fd = -1;
   std::int64_t connect_started = 0;
   std::int64_t next_dial = 0;
+  std::vector<sy::Message> held;  // relayed while upstream was down
+  std::size_t held_bytes = 0;
   std::uint32_t next_seq = 0;
   std::int64_t last_sync = 0;
   std::int64_t last_walk = 0;
@@ -211,6 +213,14 @@ int main(int argc, char** argv) {
     hello.payload = "hello";
     hello.hlc = hlc.tick(clock.now());
     send_to(fd, hello);
+
+    if (!held.empty()) {
+      log(cfg, "forwarding " + std::to_string(held.size()) +
+                   " held while upstream was down");
+    }
+    for (const auto& m : held) send_to(fd, m);
+    held.clear();
+    held_bytes = 0;
 
     // Whatever was in flight on the old link may or may not have made it, and
     // resending costs nothing: source keeps the newer version, which a copy
@@ -503,18 +513,24 @@ int main(int argc, char** argv) {
           log(cfg, "delivered at source: " + describe(msg));
           continue;
         }
-        // The origin still holds its own writes and will resend them, so a
-        // relay has nothing it needs to keep.
-        if (upstream_fd < 0) {
-          log(cfg, "upstream down, dropping " + describe(msg));
-          continue;
-        }
         if (msg.hops >= sy::kMaxHops) {
           log(cfg, "hop limit reached, dropping " + describe(msg));
           continue;
         }
-
         ++msg.hops;
+
+        // Best effort only. A write's origin keeps it until it lands and will
+        // send it again, so dropping one here costs a resend, not the write.
+        if (upstream_fd < 0) {
+          const std::size_t n = msg.origin.size() + msg.payload.size();
+          if (held_bytes + n > sy::kMaxOutbound) {
+            log(cfg, "upstream down and hold full, dropping " + describe(msg));
+          } else {
+            held_bytes += n;
+            held.push_back(std::move(msg));
+          }
+          continue;
+        }
         send_to(upstream_fd, msg);
       }
 
