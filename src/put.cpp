@@ -32,7 +32,8 @@ bool write_all(int fd, const std::vector<std::uint8_t>& bytes) {
 // clock domain, and source stamps the write when it applies it.
 int main(int argc, char** argv) {
   const auto usage = [] {
-    std::fprintf(stderr, "usage: synchrony-put HOST:PORT KEY=VALUE...\n");
+    std::fprintf(stderr,
+                 "usage: synchrony-put HOST:PORT {KEY=VALUE | -d KEY}...\n");
     return 2;
   };
   if (argc < 3) return usage();
@@ -43,15 +44,24 @@ int main(int argc, char** argv) {
 
   std::vector<std::uint8_t> out;
   for (int i = 2; i < argc; ++i) {
-    const std::string kv = argv[i];
-    const auto eq = kv.find('=');
-    if (eq == 0 || eq == std::string::npos) return usage();
-
     sy::Message m;
-    m.type = sy::MsgType::Put;
     m.origin = "put";
     m.seq = static_cast<std::uint32_t>(i - 2);
-    m.payload = kv;
+
+    const std::string arg = argv[i];
+    if (arg == "-d") {
+      if (++i == argc) return usage();
+      m.type = sy::MsgType::Delete;
+      m.payload = argv[i];
+      if (m.payload.empty() || m.payload.find('=') != std::string::npos) {
+        return usage();
+      }
+    } else {
+      const auto eq = arg.find('=');
+      if (eq == 0 || eq == std::string::npos) return usage();
+      m.type = sy::MsgType::Put;
+      m.payload = arg;
+    }
     const auto frame = sy::encode(m);
     out.insert(out.end(), frame.begin(), frame.end());
   }

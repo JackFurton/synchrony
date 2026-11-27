@@ -36,6 +36,10 @@ class Outbox {
   // returns their keys.
   std::vector<std::string> settle(const Store& store);
 
+  // Removes writes made before t, which source would refuse, and returns
+  // their keys.
+  std::vector<std::string> expire(std::int64_t t);
+
   // Writes not sent within the last interval, oldest version first, marked as
   // sent at now. An interval of 0 returns everything.
   std::vector<std::pair<std::string, Entry>> due(std::int64_t now,

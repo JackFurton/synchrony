@@ -68,6 +68,10 @@ let
       lib.mkForce (lib.optional (upstream != null) upstreamUrl);
     };
 
+  # Long enough that the outage subtest's writes are still accepted, short
+  # enough that the test can wait one out.
+  tombstoneTtl = 20;
+
   node = { upstream ? null, vlans }: { config, ... }: {
     imports = [ (cache { inherit upstream vlans; }) ];
     virtualisation.vlans = vlans;
@@ -84,8 +88,9 @@ let
           (pkgs.lib.getExe synchrony)
           "--id ${config.networking.hostName}"
           "--listen ${toString port}"
-        ] ++ pkgs.lib.optional (upstream != null)
-          "--upstream ${upstream}:${toString port}");
+        ] ++ (if upstream != null
+          then [ "--upstream ${upstream}:${toString port}" ]
+          else [ "--tombstone-ttl ${toString tombstoneTtl}" ]));
         Restart = "always";
         RestartSec = 1;
       };
@@ -405,6 +410,49 @@ pkgs.testers.runNixOSTest {
         assert len(nar_requests(node1, "HIT")) == 1, nar_requests(node1)
         assert len(nar_requests(source)) == 1, (
             f"source served the nar more than once: {nar_requests(source)}"
+        )
+
+    with subtest("a delete at node3 comes back to it as a tombstone"):
+        node3.succeed("synchrony-put 127.0.0.1:${toString port} -d k5")
+        source.wait_until_succeeds(
+            "journalctl -u synchrony-node -o cat "
+            "| grep -q 'delete key=k5 .* origin=node3 hops=2$'"
+        )
+        for m in relays:
+            m.wait_until_succeeds(
+                "journalctl -u synchrony-node -o cat "
+                "| grep -q 'applied key=k5 .* deleted$'"
+            )
+        node3.wait_until_succeeds(
+            "journalctl -u synchrony-node -o cat | grep -q 'landed key=k5 '"
+        )
+        node3.wait_until_succeeds(
+            "journalctl -u synchrony-node -o cat | grep -q 'keys=1051$'"
+        )
+
+    # node3 holds k7 when node2 goes down. While it is cut off, source deletes
+    # k7 and later collects the tombstone, so when node2 comes back there is
+    # nothing anywhere that says k7 was deleted. Upstream lacking a key is
+    # also what an upstream that restarted empty looks like, so node3 cannot
+    # tell from the walk alone. The horizon is what tells it.
+    with subtest("a replica that missed a collected tombstone starts over"):
+        node2.succeed("systemctl stop synchrony-node")
+        source.succeed("synchrony-put 127.0.0.1:${toString port} -d k7")
+        source.wait_until_succeeds(
+            "journalctl -u synchrony-node -o cat | grep -q 'delete key=k7 '"
+        )
+        time.sleep(${toString tombstoneTtl} + 5)
+        node2.succeed("systemctl start synchrony-node")
+
+        node3.wait_until_succeeds(
+            "journalctl -u synchrony-node -o cat | grep -q 'refilling from scratch'"
+        )
+        # 1051 less k7. Kept as a ghost, it would stay 1051 forever.
+        node3.wait_until_succeeds(
+            "journalctl -u synchrony-node -o cat | grep -q 'keys=1050$'"
+        )
+        assert count(node2, "refilling from scratch") == 0, (
+            "node2 restarted empty and had nothing to wipe"
         )
   '';
 }

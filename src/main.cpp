@@ -33,6 +33,7 @@ constexpr std::int64_t kConnectTimeoutNs = 3'000'000'000;
 // once-a-second walks, so a resend means something was actually lost.
 constexpr std::int64_t kResendNs = 5'000'000'000;
 constexpr std::size_t kOutboxKeys = 10'000;
+constexpr std::int64_t kSecondNs = 1'000'000'000;
 constexpr int kPollTimeoutMs = 100;
 
 struct Config {
@@ -40,6 +41,10 @@ struct Config {
   std::uint16_t listen_port = 9000;
   std::string upstream_host;
   std::uint16_t upstream_port = 0;
+  // How long source keeps a tombstone. Also the longest a write can sit in an
+  // outbox and still be accepted, and the longest a replica can go without
+  // catching up before it has to start over.
+  std::int64_t tombstone_ttl_s = 600;
 };
 
 void log(const Config& cfg, const std::string& msg) {
@@ -61,6 +66,9 @@ bool parse_args(int argc, char** argv, Config& cfg) {
       cfg.id = argv[++i];
     } else if (arg == "--listen" && has_value) {
       cfg.listen_port = static_cast<std::uint16_t>(std::atoi(argv[++i]));
+    } else if (arg == "--tombstone-ttl" && has_value) {
+      cfg.tombstone_ttl_s = std::atoll(argv[++i]);
+      if (cfg.tombstone_ttl_s <= 0) return false;
     } else if (arg == "--upstream" && has_value) {
       const std::string hostport = argv[++i];
       const auto colon = hostport.rfind(':');
@@ -95,7 +103,7 @@ int main(int argc, char** argv) {
   if (!parse_args(argc, argv, cfg)) {
     std::fprintf(stderr,
                  "usage: synchrony-node --id NAME --listen PORT "
-                 "[--upstream HOST:PORT]\n");
+                 "[--upstream HOST:PORT] [--tombstone-ttl SECONDS]\n");
     return 2;
   }
 
@@ -184,11 +192,11 @@ int main(int argc, char** argv) {
   // the header HLC so source applies it at that version, however late.
   const auto send_write = [&](const std::string& key, const sy::Entry& e) {
     sy::Message m;
-    m.type = sy::MsgType::Put;
+    m.type = e.tombstone ? sy::MsgType::Delete : sy::MsgType::Put;
     m.origin = cfg.id;
     m.seq = next_seq++;
     m.hlc = e.version;
-    m.payload = key + "=" + e.value;
+    m.payload = e.tombstone ? key : key + "=" + e.value;
     send_to(upstream_fd, m);
   };
 
@@ -253,6 +261,15 @@ int main(int argc, char** argv) {
     }
 
     const std::int64_t raw_now = sy::now_ns();
+
+    if (is_source) {
+      sy::Horizon& h = store.horizon();
+      h.current_as_of = clock.now();
+      h.collect_before = h.current_as_of - cfg.tombstone_ttl_s * kSecondNs;
+      if (const std::size_t n = store.collect(h.collect_before); n > 0) {
+        log(cfg, "collected " + std::to_string(n) + " tombstones");
+      }
+    }
 
     if (connecting_fd >= 0) {
       const int fd = connecting_fd;
@@ -398,7 +415,8 @@ int main(int argc, char** argv) {
             log(cfg, "applied key=" + key +
                          " version=" + sy::to_string(e->version) +
                          " lag_us=" +
-                         std::to_string((clock.now() - e->version.wall) / 1000));
+                         std::to_string((clock.now() - e->version.wall) / 1000) +
+                         (e->tombstone ? " deleted" : ""));
           }
 
           if (step == sy::Walk::Step::Malformed) {
@@ -419,9 +437,22 @@ int main(int argc, char** argv) {
                            " outbox=" + std::to_string(outbox.size()));
             }
           }
+          for (const auto& key :
+               outbox.expire(store.horizon().collect_before)) {
+            log(cfg, "expired key=" + key + " outbox=" +
+                         std::to_string(outbox.size()));
+          }
 
           walking.active = false;
           const auto& st = walking.walk.stats();
+          if (st.wiped) {
+            log(cfg, "upstream collected tombstones from before this replica "
+                     "last caught up, refilling from scratch");
+          }
+          if (st.collected > 0) {
+            log(cfg, "collected " + std::to_string(st.collected) +
+                         " tombstones");
+          }
           if (st.round_trips > 1) {
             log(cfg, "anti-entropy upstream=" + msg.origin +
                          " round_trips=" + std::to_string(st.round_trips) +
@@ -429,7 +460,9 @@ int main(int argc, char** argv) {
                          " entries=" + std::to_string(st.entries) +
                          " applied=" + std::to_string(st.applied) +
                          " bytes=" + std::to_string(st.bytes) +
-                         " keys=" + std::to_string(store.size()));
+                         " tombstones=" +
+                         std::to_string(store.size() - store.live()) +
+                         " keys=" + std::to_string(store.live()));
           }
           continue;
         }
@@ -470,26 +503,40 @@ int main(int argc, char** argv) {
 
         log(cfg, "recv " + describe(msg));
 
-        if (msg.type == sy::MsgType::Put) {
+        if (msg.type == sy::MsgType::Put || msg.type == sy::MsgType::Delete) {
+          const bool del = msg.type == sy::MsgType::Delete;
           const auto eq = msg.payload.find('=');
-          if (eq == 0 || eq == std::string::npos) {
-            log(cfg, "malformed put, dropping " + describe(msg));
+          if (del ? (msg.payload.empty() || eq != std::string::npos)
+                  : (eq == 0 || eq == std::string::npos)) {
+            log(cfg, "malformed write, dropping " + describe(msg));
             continue;
           }
-          const std::string key = msg.payload.substr(0, eq);
+          const std::string key = del ? msg.payload : msg.payload.substr(0, eq);
 
           // Nothing in the chain has stamped it yet, so it came straight from
           // a client and this node is the one that accepted it.
           const bool from_client = msg.hlc == sy::Hlc{};
-          const sy::Entry e{msg.payload.substr(eq + 1),
-                            from_client ? hlc.tick(clock.now()) : msg.hlc};
+          sy::Entry e;
+          e.value = del ? std::string() : msg.payload.substr(eq + 1);
+          e.version = from_client ? hlc.tick(clock.now()) : msg.hlc;
+          e.tombstone = del;
 
           // Only source applies writes. Versions come from whichever node
           // accepted each write, so a write that sat out an outage still
           // loses to anything written after it, however late it arrives.
           if (is_source) {
+            const char* verb = del ? "delete" : "put";
+            // A tombstone that would have stopped this may already be gone.
+            if (e.version.wall < store.horizon().collect_before) {
+              log(cfg, std::string(verb) + " key=" + key +
+                           " version=" + sy::to_string(e.version) +
+                           " origin=" + msg.origin + " expired");
+              continue;
+            }
+            e.applied = hlc.tick(clock.now());
             const bool kept = store.apply(key, e);
-            log(cfg, "put key=" + key + " version=" + sy::to_string(e.version) +
+            log(cfg, std::string(verb) + " key=" + key +
+                         " version=" + sy::to_string(e.version) +
                          " origin=" + msg.origin +
                          " hops=" + std::to_string(msg.hops) +
                          (kept ? "" : " stale"));
@@ -498,7 +545,7 @@ int main(int argc, char** argv) {
 
           if (from_client) {
             if (!outbox.add(key, e)) {
-              log(cfg, "outbox full, refusing put key=" + key);
+              log(cfg, "outbox full, refusing write key=" + key);
               continue;
             }
             log(cfg, "accepted key=" + key +

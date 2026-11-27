@@ -18,7 +18,7 @@ int failures = 0;
   } while (0)
 
 sy::Entry at(const std::string& value, std::int64_t wall) {
-  return {value, {wall, 0}};
+  return {value, {wall, 0}, {wall, 0}};
 }
 
 // The whole exchange with the network taken out: downstream asks, upstream
@@ -167,6 +167,112 @@ void response_to_a_different_question_is_malformed() {
   CHECK(walk.on_tree(down, resp, next) == sy::Walk::Step::Malformed);
 }
 
+
+sy::Entry tombstone(std::int64_t wall) {
+  sy::Entry e{"", {wall, 0}, {wall, 0}};
+  e.tombstone = true;
+  return e;
+}
+
+void a_delete_travels_like_a_write() {
+  sy::Store up, down;
+  up.apply("k", at("v", 1));
+  sync(up, down);
+  CHECK(down.live() == 1);
+
+  up.apply("k", tombstone(2));
+  std::vector<std::string> applied;
+  sync(up, down, &applied);
+  CHECK(applied == std::vector<std::string>{"k"});
+  CHECK(down.get("k") && down.get("k")->tombstone);
+  CHECK(down.live() == 0);
+  CHECK(down.root() == up.root());
+
+  // And an older write that turns up late still loses to it.
+  CHECK(!down.apply("k", at("late", 1)));
+}
+
+// Both sides have to drop the same tombstones, or their trees never agree.
+void downstream_collects_what_upstream_collected() {
+  sy::Store up, down;
+  up.apply("old", tombstone(10));
+  up.apply("new", tombstone(30));
+  up.horizon() = {0, 100};
+  sync(up, down);
+  CHECK(down.size() == 2);
+
+  up.horizon() = {20, 200};
+  CHECK(up.collect(20) == 1);
+  const auto s = sync(up, down);
+  CHECK(s.collected == 1);
+  CHECK(!s.wiped);
+  CHECK(down.get("old") == nullptr && down.get("new") != nullptr);
+  CHECK(down.root() == up.root());
+  CHECK(down.horizon().collect_before == 20);
+}
+
+// The case the horizon exists for. down holds k, misses both the delete and
+// the collection while partitioned, and nothing in a normal walk would ever
+// tell it k is gone: upstream simply lacks it, and lacking is what an
+// upstream that restarted empty looks like too.
+void replica_that_missed_a_collection_starts_over() {
+  sy::Store up, down;
+  up.apply("k", at("v", 5));
+  up.apply("other", at("v", 6));
+  up.horizon() = {0, 10};
+  sync(up, down);
+  CHECK(down.horizon().current_as_of == 10);
+
+  up.apply("k", tombstone(30));
+  up.horizon() = {40, 100};
+  up.collect(40);
+
+  const auto s = sync(up, down);
+  CHECK(s.wiped);
+  CHECK(down.get("k") == nullptr);
+  CHECK(down.get("other") != nullptr);
+  CHECK(down.root() == up.root());
+  CHECK(down.horizon().current_as_of == 100);
+}
+
+void replica_that_kept_up_is_not_wiped() {
+  sy::Store up, down;
+  up.apply("k", at("v", 5));
+  up.horizon() = {0, 50};
+  sync(up, down);
+
+  up.horizon() = {40, 100};
+  CHECK(!sync(up, down).wiped);
+  CHECK(down.horizon().current_as_of == 100);
+}
+
+// Extras are what an upstream that restarted empty leaves behind. Until they
+// are reconciled this replica is not equal to upstream, so it must not claim
+// to be current.
+void extras_hold_back_current_as_of() {
+  sy::Store up, down;
+  down.apply("mine", at("v", 1));
+  up.apply("theirs", at("v", 2));
+  up.horizon() = {0, 100};
+  sync(up, down);
+  CHECK(down.get("mine") != nullptr);
+  CHECK(down.horizon().current_as_of == 0);
+}
+
+void truncated_walk_does_not_count_as_caught_up() {
+  sy::Store up, down;
+  const std::string value(1000, 'x');
+  for (int i = 0; i < 1000; ++i) up.apply("k" + std::to_string(i), at(value, i));
+  up.horizon() = {0, 100};
+
+  sync(up, down);
+  CHECK(down.root() != up.root());
+  CHECK(down.horizon().current_as_of == 0);
+  while (down.root() != up.root()) sync(up, down);
+  sync(up, down);
+  CHECK(down.horizon().current_as_of == 100);
+}
+
 }  // namespace
 
 int main() {
@@ -180,6 +286,12 @@ int main() {
   big_diff_spans_several_walks();
   malformed_requests_are_refused();
   response_to_a_different_question_is_malformed();
+  a_delete_travels_like_a_write();
+  downstream_collects_what_upstream_collected();
+  replica_that_missed_a_collection_starts_over();
+  replica_that_kept_up_is_not_wiped();
+  extras_hold_back_current_as_of();
+  truncated_walk_does_not_count_as_caught_up();
 
   if (failures > 0) {
     std::fprintf(stderr, "%d check(s) failed\n", failures);

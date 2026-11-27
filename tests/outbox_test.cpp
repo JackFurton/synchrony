@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -17,7 +18,7 @@ int failures = 0;
   } while (0)
 
 sy::Entry at(const std::string& value, std::int64_t wall) {
-  return {value, {wall, 0}};
+  return {value, {wall, 0}, {wall, 0}};
 }
 
 void drains_in_version_order() {
@@ -96,6 +97,14 @@ void update_is_due_immediately() {
   CHECK(d.size() == 1 && d[0].second.value == "2");
 }
 
+void expires_what_source_would_refuse() {
+  sy::Outbox o(10);
+  o.add("old", at("v", 10));
+  o.add("new", at("v", 30));
+  CHECK(o.expire(20) == std::vector<std::string>{"old"});
+  CHECK(o.size() == 1);
+}
+
 }  // namespace
 
 int main() {
@@ -105,6 +114,7 @@ int main() {
   settles_on_same_or_newer_version();
   resends_only_what_has_waited();
   update_is_due_immediately();
+  expires_what_source_would_refuse();
 
   if (failures > 0) {
     std::fprintf(stderr, "%d check(s) failed\n", failures);

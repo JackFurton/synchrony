@@ -29,6 +29,19 @@ std::vector<std::string> Outbox::settle(const Store& store) {
   return landed;
 }
 
+std::vector<std::string> Outbox::expire(std::int64_t t) {
+  std::vector<std::string> gone;
+  for (auto it = queued_.begin(); it != queued_.end();) {
+    if (it->second.entry.version.wall < t) {
+      gone.push_back(it->first);
+      it = queued_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  return gone;
+}
+
 std::vector<std::pair<std::string, Entry>> Outbox::due(std::int64_t now,
                                                        std::int64_t interval) {
   std::vector<std::pair<std::string, Entry>> out;
