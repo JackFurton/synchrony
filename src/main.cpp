@@ -208,10 +208,9 @@ int main(int argc, char** argv) {
 
       if (!(pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
 
-      if (!it->second.fill()) {
-        drop(fd, "closed");
-        continue;
-      }
+      // A peer that writes and then closes hands over both in the same read,
+      // so whatever arrived before the close is decoded before acting on it.
+      const bool open = it->second.fill();
 
       bool fatal = false;
       bool gone = false;
@@ -291,7 +290,11 @@ int main(int argc, char** argv) {
       }
 
       if (gone) continue;
-      if (fatal) drop(fd, "malformed frame");
+      if (fatal) {
+        drop(fd, "malformed frame");
+      } else if (!open) {
+        drop(fd, "closed");
+      }
     }
   }
 }
