@@ -178,6 +178,8 @@ int main(int argc, char** argv) {
     return peers.find(fd) != peers.end();
   };
 
+  // False if sending lost upstream, which is usually the link the caller is
+  // in the middle of reading.
   const auto send_walk = [&](const sy::Walk::Request& r) {
     sy::Message req;
     req.type = r.type;
@@ -185,7 +187,9 @@ int main(int argc, char** argv) {
     req.seq = walking.seq;
     req.payload = r.payload;
     req.hlc = hlc.tick(clock.now());
-    send_to(upstream_fd, req);
+    const int fd = upstream_fd;
+    send_to(fd, req);
+    return peers.find(fd) != peers.end();
   };
 
   for (;;) {
@@ -333,7 +337,10 @@ int main(int argc, char** argv) {
             break;
           }
           if (step == sy::Walk::Step::Next) {
-            send_walk(next);
+            if (!send_walk(next)) {
+              gone = true;
+              break;
+            }
             continue;
           }
 
