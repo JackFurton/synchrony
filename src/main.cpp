@@ -17,6 +17,7 @@
 #include "clock.hpp"
 #include "hlc.hpp"
 #include "net.hpp"
+#include "outbox.hpp"
 #include "peer.hpp"
 #include "store.hpp"
 #include "wire.hpp"
@@ -26,6 +27,12 @@ namespace {
 constexpr std::int64_t kSyncIntervalNs = 500'000'000;
 constexpr std::int64_t kSyncTimeoutNs = 4'000'000'000;
 constexpr std::int64_t kWalkIntervalNs = 1'000'000'000;
+constexpr std::int64_t kRedialNs = 1'000'000'000;
+constexpr std::int64_t kConnectTimeoutNs = 3'000'000'000;
+// Long enough for a write to reach source and come back down three hops of
+// once-a-second walks, so a resend means something was actually lost.
+constexpr std::int64_t kResendNs = 5'000'000'000;
+constexpr std::size_t kOutboxKeys = 10'000;
 constexpr int kPollTimeoutMs = 100;
 
 struct Config {
@@ -68,16 +75,6 @@ bool parse_args(int argc, char** argv, Config& cfg) {
   return true;
 }
 
-// Upstream may boot after us, so a refused connect is expected, not fatal.
-int dial_upstream(const Config& cfg, int attempts) {
-  for (int i = 0; i < attempts; ++i) {
-    const int fd = sy::dial(cfg.upstream_host, cfg.upstream_port);
-    if (fd >= 0) return fd;
-    ::sleep(1);
-  }
-  return -1;
-}
-
 struct Pending {
   bool active = false;
   std::uint32_t seq = 0;
@@ -114,33 +111,23 @@ int main(int argc, char** argv) {
   sy::Clock clock;
   sy::HlcClock hlc;
   sy::Store store;
+  sy::Outbox outbox(kOutboxKeys);
   Pending pending;
   Walking walking;
+  // Being source is configuration, not the absence of a live upstream: a
+  // node that has lost its upstream is partitioned, not promoted.
+  const bool is_source = cfg.upstream_host.empty();
   int upstream_fd = -1;
+  int connecting_fd = -1;
+  std::int64_t connect_started = 0;
+  std::int64_t next_dial = 0;
+  std::vector<sy::Message> held;  // relayed while upstream was down
+  std::size_t held_bytes = 0;
   std::uint32_t next_seq = 0;
   std::int64_t last_sync = 0;
   std::int64_t last_walk = 0;
 
-  if (!cfg.upstream_host.empty()) {
-    upstream_fd = dial_upstream(cfg, 30);
-    if (upstream_fd < 0) {
-      std::fprintf(stderr, "upstream %s:%u unreachable\n",
-                   cfg.upstream_host.c_str(), cfg.upstream_port);
-      return 1;
-    }
-    sy::set_nonblocking(upstream_fd);
-    peers.emplace(upstream_fd, sy::Peer(upstream_fd));
-    log(cfg, "upstream connected: " + cfg.upstream_host + ":" +
-                 std::to_string(cfg.upstream_port));
-
-    sy::Message hello;
-    hello.type = sy::MsgType::Hello;
-    hello.origin = cfg.id;
-    hello.seq = next_seq++;
-    hello.payload = "hello";
-    hello.hlc = hlc.tick(clock.now());
-    peers.at(upstream_fd).queue(sy::encode(hello));
-  } else {
+  if (is_source) {
     log(cfg, "no upstream, acting as source; clock is the reference");
   }
 
@@ -152,6 +139,7 @@ int main(int argc, char** argv) {
       upstream_fd = -1;
       pending.active = false;
       walking.active = false;
+      next_dial = sy::now_ns() + kRedialNs;
     }
   };
 
@@ -192,7 +180,62 @@ int main(int argc, char** argv) {
     return peers.find(fd) != peers.end();
   };
 
+  // The version was fixed when this node accepted the write, and goes out as
+  // the header HLC so source applies it at that version, however late.
+  const auto send_write = [&](const std::string& key, const sy::Entry& e) {
+    sy::Message m;
+    m.type = sy::MsgType::Put;
+    m.origin = cfg.id;
+    m.seq = next_seq++;
+    m.hlc = e.version;
+    m.payload = key + "=" + e.value;
+    send_to(upstream_fd, m);
+  };
+
+  const auto flush_outbox = [&](std::int64_t interval) {
+    if (upstream_fd < 0) return;
+    for (const auto& [key, e] : outbox.due(sy::now_ns(), interval)) {
+      send_write(key, e);
+    }
+  };
+
+  const auto upstream_connected = [&](int fd) {
+    upstream_fd = fd;
+    peers.emplace(fd, sy::Peer(fd));
+    log(cfg, "upstream connected: " + cfg.upstream_host + ":" +
+                 std::to_string(cfg.upstream_port) +
+                 " outbox=" + std::to_string(outbox.size()));
+
+    sy::Message hello;
+    hello.type = sy::MsgType::Hello;
+    hello.origin = cfg.id;
+    hello.seq = next_seq++;
+    hello.payload = "hello";
+    hello.hlc = hlc.tick(clock.now());
+    send_to(fd, hello);
+
+    if (!held.empty()) {
+      log(cfg, "forwarding " + std::to_string(held.size()) +
+                   " held while upstream was down");
+    }
+    for (const auto& m : held) send_to(fd, m);
+    held.clear();
+    held_bytes = 0;
+
+    // Whatever was in flight on the old link may or may not have made it, and
+    // resending costs nothing: source keeps the newer version, which a copy
+    // of the same write is not.
+    flush_outbox(0);
+  };
+
   for (;;) {
+    if (!is_source && upstream_fd < 0 && connecting_fd < 0 &&
+        sy::now_ns() >= next_dial) {
+      connecting_fd = sy::dial_async(cfg.upstream_host, cfg.upstream_port);
+      connect_started = sy::now_ns();
+      if (connecting_fd < 0) next_dial = connect_started + kRedialNs;
+    }
+
     std::vector<pollfd> pfds;
     pfds.push_back({listen_fd, POLLIN, 0});
     for (auto& [fd, peer] : peers) {
@@ -200,6 +243,8 @@ int main(int argc, char** argv) {
           {fd,
            static_cast<short>(POLLIN | (peer.wants_write() ? POLLOUT : 0)), 0});
     }
+    const std::size_t peer_end = pfds.size();
+    if (connecting_fd >= 0) pfds.push_back({connecting_fd, POLLOUT, 0});
 
     if (::poll(pfds.data(), pfds.size(), kPollTimeoutMs) < 0) {
       if (errno == EINTR) continue;
@@ -208,6 +253,30 @@ int main(int argc, char** argv) {
     }
 
     const std::int64_t raw_now = sy::now_ns();
+
+    if (connecting_fd >= 0) {
+      const int fd = connecting_fd;
+      if (pfds.back().revents & (POLLOUT | POLLERR | POLLHUP)) {
+        connecting_fd = -1;
+        const int err = sy::connect_error(fd);
+        if (err == 0) {
+          upstream_connected(fd);
+        } else {
+          log(cfg, std::string("upstream dial failed: ") + std::strerror(err));
+          ::close(fd);
+          next_dial = raw_now + kRedialNs;
+        }
+      } else if (raw_now - connect_started > kConnectTimeoutNs) {
+        // A host that is down entirely never answers the SYN, and the kernel
+        // would wait minutes before saying so.
+        log(cfg, "upstream dial timed out");
+        connecting_fd = -1;
+        ::close(fd);
+        next_dial = raw_now;
+      }
+    }
+
+    flush_outbox(kResendNs);
 
     if (pending.active && raw_now - pending.t1 > kSyncTimeoutNs) {
       log(cfg, "sync timed out, will retry");
@@ -248,7 +317,7 @@ int main(int argc, char** argv) {
       }
     }
 
-    for (std::size_t i = 1; i < pfds.size(); ++i) {
+    for (std::size_t i = 1; i < peer_end; ++i) {
       const int fd = pfds[i].fd;
       auto it = peers.find(fd);
       if (it == peers.end()) continue;
@@ -321,9 +390,9 @@ int main(int argc, char** argv) {
                   ? walking.walk.on_tree(store, msg.payload, next)
                   : walking.walk.on_leaves(store, msg.payload, applied);
 
-          // lag is how long the write took to get here from source, read off
-          // this node's corrected clock against source's stamp, so it is only
-          // as good as the clock sync.
+          // lag is how long the write took to get here from the node that
+          // accepted it, read off this node's corrected clock against that
+          // node's stamp, so it is only as good as the clock sync on both.
           for (const auto& key : applied) {
             const sy::Entry* e = store.get(key);
             log(cfg, "applied key=" + key +
@@ -342,6 +411,13 @@ int main(int argc, char** argv) {
               break;
             }
             continue;
+          }
+
+          if (!applied.empty() && outbox.size() > 0) {
+            for (const auto& key : outbox.settle(store)) {
+              log(cfg, "landed key=" + key +
+                           " outbox=" + std::to_string(outbox.size()));
+            }
           }
 
           walking.active = false;
@@ -394,24 +470,46 @@ int main(int argc, char** argv) {
 
         log(cfg, "recv " + describe(msg));
 
-        // Only source applies writes, so versions come from one clock and
-        // the newest version of a key is simply the latest write.
-        if (upstream_fd < 0 && msg.type == sy::MsgType::Put) {
+        if (msg.type == sy::MsgType::Put) {
           const auto eq = msg.payload.find('=');
           if (eq == 0 || eq == std::string::npos) {
             log(cfg, "malformed put, dropping " + describe(msg));
             continue;
           }
           const std::string key = msg.payload.substr(0, eq);
-          const sy::Entry e{msg.payload.substr(eq + 1), hlc.tick(clock.now())};
-          store.apply(key, e);
-          log(cfg, "put key=" + key + " version=" + sy::to_string(e.version) +
-                       " origin=" + msg.origin +
-                       " hops=" + std::to_string(msg.hops));
-          continue;
+
+          // Nothing in the chain has stamped it yet, so it came straight from
+          // a client and this node is the one that accepted it.
+          const bool from_client = msg.hlc == sy::Hlc{};
+          const sy::Entry e{msg.payload.substr(eq + 1),
+                            from_client ? hlc.tick(clock.now()) : msg.hlc};
+
+          // Only source applies writes. Versions come from whichever node
+          // accepted each write, so a write that sat out an outage still
+          // loses to anything written after it, however late it arrives.
+          if (is_source) {
+            const bool kept = store.apply(key, e);
+            log(cfg, "put key=" + key + " version=" + sy::to_string(e.version) +
+                         " origin=" + msg.origin +
+                         " hops=" + std::to_string(msg.hops) +
+                         (kept ? "" : " stale"));
+            continue;
+          }
+
+          if (from_client) {
+            if (!outbox.add(key, e)) {
+              log(cfg, "outbox full, refusing put key=" + key);
+              continue;
+            }
+            log(cfg, "accepted key=" + key +
+                         " version=" + sy::to_string(e.version) +
+                         " outbox=" + std::to_string(outbox.size()));
+            flush_outbox(kResendNs);
+            continue;
+          }
         }
 
-        if (upstream_fd < 0) {
+        if (is_source) {
           log(cfg, "delivered at source: " + describe(msg));
           continue;
         }
@@ -419,8 +517,20 @@ int main(int argc, char** argv) {
           log(cfg, "hop limit reached, dropping " + describe(msg));
           continue;
         }
-
         ++msg.hops;
+
+        // Best effort only. A write's origin keeps it until it lands and will
+        // send it again, so dropping one here costs a resend, not the write.
+        if (upstream_fd < 0) {
+          const std::size_t n = msg.origin.size() + msg.payload.size();
+          if (held_bytes + n > sy::kMaxOutbound) {
+            log(cfg, "upstream down and hold full, dropping " + describe(msg));
+          } else {
+            held_bytes += n;
+            held.push_back(std::move(msg));
+          }
+          continue;
+        }
         send_to(upstream_fd, msg);
       }
 

@@ -58,6 +58,39 @@ int dial(const std::string& host, std::uint16_t port) {
   return fd;
 }
 
+int dial_async(const std::string& host, std::uint16_t port) {
+  addrinfo hints{};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+
+  addrinfo* res = nullptr;
+  const std::string service = std::to_string(port);
+  if (::getaddrinfo(host.c_str(), service.c_str(), &hints, &res) != 0) {
+    errno = EHOSTUNREACH;
+    return -1;
+  }
+
+  const int fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  if (fd >= 0 && (set_nonblocking(fd) < 0 ||
+                  (::connect(fd, res->ai_addr, res->ai_addrlen) < 0 &&
+                   errno != EINPROGRESS))) {
+    const int saved = errno;
+    ::close(fd);
+    ::freeaddrinfo(res);
+    errno = saved;
+    return -1;
+  }
+  ::freeaddrinfo(res);
+  return fd;
+}
+
+int connect_error(int fd) {
+  int err = 0;
+  socklen_t len = sizeof(err);
+  if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) return errno;
+  return err;
+}
+
 int set_nonblocking(int fd) {
   const int flags = ::fcntl(fd, F_GETFL, 0);
   if (flags < 0) return -1;
