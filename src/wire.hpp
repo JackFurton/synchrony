@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "hlc.hpp"
+
 namespace sy {
 
 // Frame layout, all integers big endian:
@@ -16,12 +18,14 @@ namespace sy {
 //   6       1     hop count
 //   7       1     origin length
 //   8       4     sequence number
-//   12      n     origin id
-//   12+n    rest  payload
+//   12      8     HLC wall time, ns
+//   20      4     HLC logical counter
+//   24      n     origin id
+//   24+n    rest  payload
 //
 // Length is capped so a corrupt or hostile header cannot make us allocate the
 // heap away before we have read a single byte of the body.
-constexpr std::uint8_t kVersion = 1;
+constexpr std::uint8_t kVersion = 2;
 constexpr std::uint32_t kMaxFrame = 1u << 20;
 
 // A message that has been round the chain more times than there are nodes is a
@@ -39,6 +43,7 @@ struct Message {
   MsgType type = MsgType::Data;
   std::uint8_t hops = 0;
   std::uint32_t seq = 0;
+  Hlc hlc;  // when origin sent it; relays pass it through untouched
   std::string origin;
   std::string payload;
 };

@@ -2,6 +2,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include "clock.hpp"
+#include "hlc.hpp"
 #include "net.hpp"
 #include "peer.hpp"
 #include "wire.hpp"
@@ -37,7 +39,7 @@ void log(const Config& cfg, const std::string& msg) {
 std::string describe(const sy::Message& m) {
   return std::string(sy::to_string(m.type)) + " origin=" + m.origin +
          " hops=" + std::to_string(m.hops) + " seq=" + std::to_string(m.seq) +
-         " payload=" + m.payload;
+         " hlc=" + sy::to_string(m.hlc) + " payload=" + m.payload;
 }
 
 bool parse_args(int argc, char** argv, Config& cfg) {
@@ -99,6 +101,7 @@ int main(int argc, char** argv) {
 
   std::map<int, sy::Peer> peers;
   sy::Clock clock;
+  sy::HlcClock hlc;
   Pending pending;
   int upstream_fd = -1;
   std::uint32_t next_seq = 0;
@@ -121,6 +124,7 @@ int main(int argc, char** argv) {
     hello.origin = cfg.id;
     hello.seq = next_seq++;
     hello.payload = "hello";
+    hello.hlc = hlc.tick(clock.now());
     peers.at(upstream_fd).queue(sy::encode(hello));
   } else {
     log(cfg, "no upstream, acting as source; clock is the reference");
@@ -174,6 +178,7 @@ int main(int argc, char** argv) {
       req.type = sy::MsgType::TimeReq;
       req.origin = cfg.id;
       req.seq = next_seq++;
+      req.hlc = hlc.tick(clock.now());
 
       pending = {true, req.seq, sy::now_ns()};
       last_sync = raw_now;
@@ -219,12 +224,15 @@ int main(int argc, char** argv) {
           break;
         }
 
+        hlc.merge(msg.hlc, clock.now());
+
         if (msg.type == sy::MsgType::TimeReq) {
           sy::Message resp;
           resp.type = sy::MsgType::TimeResp;
           resp.origin = cfg.id;
           resp.seq = msg.seq;  // echoed, so the asker can match it
           resp.payload = sy::encode_i64(clock.now());
+          resp.hlc = hlc.tick(clock.now());
           send_to(fd, resp);
           if (peers.find(fd) == peers.end()) {
             gone = true;
@@ -251,9 +259,19 @@ int main(int argc, char** argv) {
           clock.set_offset_ns(offset);
           pending.active = false;
 
+          // A lower offset moves this node's clock backwards. Measure how far,
+          // then take the next timestamp across the step to show it held.
+          const std::int64_t pt = clock.now();
+          const std::int64_t stepped_back =
+              std::max<std::int64_t>(0, hlc.last().wall - pt);
+          const sy::Hlc stamp = hlc.tick(pt);
+
           log(cfg, "sync upstream=" + msg.origin +
                        " rtt_us=" + std::to_string(rtt / 1000) +
-                       " offset_us=" + std::to_string(offset / 1000));
+                       " offset_us=" + std::to_string(offset / 1000) +
+                       " hlc=" + sy::to_string(stamp) +
+                       " stepped_back_us=" +
+                       std::to_string(stepped_back / 1000));
           continue;
         }
 

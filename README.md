@@ -32,9 +32,10 @@ $B --id node2  --listen 9002 --upstream 127.0.0.1:9001 &
 $B --id node3  --listen 9003 --upstream 127.0.0.1:9002 &
 ```
 
-source logs `delivered at source: hello origin=node3 hops=2 seq=0
+source logs `delivered at source: hello origin=node3 hops=2 seq=0 hlc=...
 payload=hello`, which is the whole chain in one line: node3 spoke, and two other
-nodes relayed it before it arrived.
+nodes relayed it before it arrived. The hlc is node3's hybrid logical clock at
+the moment it sent, carried through unchanged.
 
 Loopback proves the code path but not the topology: nothing stops node3 dialling
 source directly. That is what the VM test is for.

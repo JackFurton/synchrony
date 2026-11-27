@@ -66,6 +66,21 @@ pkgs.testers.runNixOSTest {
         raise Exception(f"{m.name} offset never settled, last was {prev}")
 
 
+    def sync_lines(m):
+        out = m.succeed(
+            "journalctl -u synchrony-node -o cat | grep ' sync upstream='"
+        )
+        rows = []
+        for line in out.strip().splitlines():
+            f = dict(kv.split("=", 1) for kv in line.split() if "=" in kv)
+            wall, logical = f["hlc"].split(".")
+            rows.append({
+                "hlc": (int(wall), int(logical)),
+                "stepped_back_us": int(f["stepped_back_us"]),
+            })
+        return rows
+
+
     def netem(m, dev, ms, first=False):
         verb = "add" if first else "change"
         m.succeed(f"tc qdisc {verb} dev {dev} root netem delay {ms}ms")
@@ -119,6 +134,8 @@ pkgs.testers.runNixOSTest {
     # round trip down the middle, so each hop is wrong by (10 - 50) / 2 and
     # inherits its upstream's error on top of its own.
     with subtest("asymmetric delay stacks one hop at a time"):
+        seen_before = {m.name: len(sync_lines(m)) for m in relays}
+
         for m, dev, delay_ms in links:
             netem(m, dev, delay_ms)
 
@@ -134,5 +151,31 @@ pkgs.testers.runNixOSTest {
         assert (
             abs(moved["node3"]) > abs(moved["node2"]) > abs(moved["node1"])
         ), f"error did not grow with hop count: {moved}"
+
+    # Switching to asymmetric links pulled every offset estimate down by 20ms
+    # or more, so every node's corrected clock jumped backwards. The drop can
+    # arrive in pieces, since a sync in flight while the links change sees one
+    # old direction and one new, hence 5ms: well clear of the tens-of-us jitter
+    # but no bigger than the smallest piece. The HLC has to have held through
+    # every one of those jumps.
+    with subtest("hlc never goes backwards, even when the clock does"):
+        for m in relays:
+            rows = sync_lines(m)
+            stamps = [r["hlc"] for r in rows]
+            for earlier, later in zip(stamps, stamps[1:]):
+                assert earlier < later, (
+                    f"{m.name} hlc went from {earlier} to {later}"
+                )
+
+            step = max(rows[seen_before[m.name]:],
+                       key=lambda r: r["stepped_back_us"])
+            print(f"{m.name}: largest step back {step['stepped_back_us']}us, "
+                  f"hlc held at {step['hlc']}")
+            assert step["stepped_back_us"] >= 5000, (
+                f"{m.name} never stepped back by 5ms: {step}"
+            )
+            assert step["hlc"][1] >= 1, (
+                f"{m.name} stepped back but hlc did not hold: {step}"
+            )
   '';
 }

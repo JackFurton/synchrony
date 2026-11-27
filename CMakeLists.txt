@@ -10,6 +10,7 @@ add_library(synchrony-core
   src/net.cpp
   src/peer.cpp
   src/clock.cpp
+  src/hlc.cpp
 )
 target_include_directories(synchrony-core PUBLIC src)
 target_compile_options(synchrony-core PRIVATE -Wall -Wextra -Wpedantic)
@@ -19,7 +20,7 @@ target_link_libraries(synchrony-node PRIVATE synchrony-core)
 target_compile_options(synchrony-node PRIVATE -Wall -Wextra -Wpedantic)
 
 enable_testing()
-foreach(test wire peer clock)
+foreach(test wire peer clock hlc)
   add_executable(${test}_test tests/${test}_test.cpp)
   target_link_libraries(${test}_test PRIVATE synchrony-core)
   target_compile_options(${test}_test PRIVATE -Wall -Wextra -Wpedantic)
