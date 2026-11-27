@@ -19,7 +19,7 @@ let
 
     services.nginx = {
       enable = true;
-      appendHttpConfig = ''
+      commonHttpConfig = ''
         log_format cache '$request_method $uri $status $upstream_cache_status $body_bytes_sent';
         proxy_cache_path /var/cache/nginx/nix keys_zone=nix:10m max_size=1g inactive=1d use_temp_path=off;
       '';
@@ -353,6 +353,8 @@ pkgs.testers.runNixOSTest {
             "/run/cache.sec /run/cache.pub && systemctl start nix-serve"
         )
         source.wait_for_open_port(${toString (cachePort + 1)})
+        for m in (source, node1, node2):
+            m.wait_for_unit("nginx.service")
         key = source.succeed("cat /run/cache.pub").strip()
 
         # 10MB of fresh randomness, so nothing on the host or any VM has it.
