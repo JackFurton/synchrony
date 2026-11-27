@@ -42,6 +42,7 @@ enum class MsgType : std::uint8_t {
   TreeResp = 7,
   LeafReq = 8,
   LeafResp = 9,
+  Delete = 10,   // payload key; travels and lands exactly like a put
 };
 
 struct Message {

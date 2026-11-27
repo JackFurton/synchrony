@@ -41,6 +41,7 @@ Writes can go in at any node, but only source applies them:
 
 ```sh
 ./result/bin/synchrony-put 127.0.0.1:9003 colour=blue
+./result/bin/synchrony-put 127.0.0.1:9003 -d colour   # delete
 ```
 
 node3 relays the put up the chain like any other message and source stamps it

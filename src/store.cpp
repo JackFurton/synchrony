@@ -86,10 +86,38 @@ bool Store::apply(const std::string& key, const Entry& e) {
   auto [it, inserted] = entries_.try_emplace({leaf, key}, e);
   if (!inserted) {
     if (!(e.version > it->second.version)) return false;
+    if (it->second.tombstone) --tombstones_;
     it->second = e;
   }
+  if (e.tombstone) ++tombstones_;
   rehash_from(leaf);
   return true;
+}
+
+std::size_t Store::collect(std::int64_t t) {
+  if (tombstones_ == 0) return 0;
+
+  std::size_t n = 0;
+  std::vector<std::uint32_t> touched;
+  for (auto it = entries_.begin(); it != entries_.end();) {
+    if (it->second.tombstone && it->second.applied.wall < t) {
+      const std::uint32_t leaf = it->first.first;
+      if (touched.empty() || touched.back() != leaf) touched.push_back(leaf);
+      it = entries_.erase(it);
+      --tombstones_;
+      ++n;
+    } else {
+      ++it;
+    }
+  }
+  for (const std::uint32_t leaf : touched) rehash_from(leaf);
+  return n;
+}
+
+void Store::clear() {
+  const Horizon h = horizon_;
+  *this = Store();
+  horizon_ = h;
 }
 
 const Entry* Store::get(const std::string& key) const {
@@ -118,6 +146,9 @@ void Store::rehash_from(std::uint32_t leaf) {
     h.str(e.value);
     h.u64(static_cast<std::uint64_t>(e.version.wall));
     h.u64(e.version.logical);
+    h.u64(static_cast<std::uint64_t>(e.applied.wall));
+    h.u64(e.applied.logical);
+    h.u64(e.tombstone ? 1 : 0);
   }
   levels_[kDepth][leaf] = h.done();
 
