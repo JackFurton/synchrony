@@ -475,29 +475,29 @@ pkgs.testers.runNixOSTest {
     with subtest("a restarted node carries its clock across the restart"):
         before = last_offset_us(node3)
         node3.succeed("systemctl restart synchrony-node")
+        node3.wait_for_open_port(${toString port})
         node3.succeed("synchrony-put 127.0.0.1:${toString port} after_restart=1")
-        source.wait_until_succeeds(
-            "journalctl -u synchrony-node -o cat | grep -q 'put key=after_restart '"
-        )
 
-        # Source's clock is the reference, so the journal's timestamp on its
-        # put line is the true time the write arrived, a few ms after node3
-        # stamped it. node1's lag would not do: it waits on anti-entropy,
-        # and a second of that hides a stamp hundreds of ms in the future.
-        line = source.succeed(
+        # What matters is the stamp against the true time at the moment node3
+        # accepted the write. journald stamps the line with node3's raw clock,
+        # and node3's offset from before the restart turns that into source's
+        # time. Anything measured later, at source or node1, also includes the
+        # reconnect and anti-entropy delays, which hide a stamp hundreds of ms
+        # in the future.
+        line = node3.succeed(
             "journalctl -u synchrony-node -o short-unix "
-            "| grep 'put key=after_restart ' | tail -1"
+            "| grep 'accepted key=after_restart ' | tail -1"
         ).split()
         secs, frac = line[0].split(".")
-        arrived_us = int(secs) * 1_000_000 + int(frac.ljust(6, "0")[:6])
+        raw_us = int(secs) * 1_000_000 + int(frac.ljust(6, "0")[:6])
         stamped_us = int(
             next(f for f in line if f.startswith("version=")).split("=")[1]
             .split(".")[0]
         ) // 1000
-        age = arrived_us - stamped_us
-        print(f"node3 offset {before}us before restart; its first write "
-              f"reached source {age}us after the time it was stamped with")
-        assert age > 0, f"stamped {-age}us in source's future"
+        skew = stamped_us - (raw_us + before)
+        print(f"node3 offset {before}us; its first write after the restart "
+              f"was stamped {skew}us off source's time")
+        assert abs(skew) < 5000, f"stamped {skew}us off source's time"
 
         restored = int(log_fields(node3, "restored clock")["offset_us"])
         assert abs(restored - before) <= 1000, (before, restored)
