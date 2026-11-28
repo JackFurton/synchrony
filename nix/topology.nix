@@ -476,17 +476,31 @@ pkgs.testers.runNixOSTest {
         before = last_offset_us(node3)
         node3.succeed("systemctl restart synchrony-node")
         node3.succeed("synchrony-put 127.0.0.1:${toString port} after_restart=1")
-        node1.wait_until_succeeds(
-            "journalctl -u synchrony-node -o cat "
-            "| grep -q 'applied key=after_restart '"
+        source.wait_until_succeeds(
+            "journalctl -u synchrony-node -o cat | grep -q 'put key=after_restart '"
         )
 
+        # Source's clock is the reference, so the journal's timestamp on its
+        # put line is the true time the write arrived, a few ms after node3
+        # stamped it. node1's lag would not do: it waits on anti-entropy,
+        # and a second of that hides a stamp hundreds of ms in the future.
+        line = source.succeed(
+            "journalctl -u synchrony-node -o short-unix "
+            "| grep 'put key=after_restart ' | tail -1"
+        ).split()
+        secs, frac = line[0].split(".")
+        arrived_us = int(secs) * 1_000_000 + int(frac.ljust(6, "0")[:6])
+        stamped_us = int(
+            next(f for f in line if f.startswith("version=")).split("=")[1]
+            .split(".")[0]
+        ) // 1000
+        age = arrived_us - stamped_us
+        print(f"node3 offset {before}us before restart; its first write "
+              f"reached source {age}us after the time it was stamped with")
+        assert age > 0, f"stamped {-age}us in source's future"
+
         restored = int(log_fields(node3, "restored clock")["offset_us"])
-        lag = int(log_fields(node1, "applied key=after_restart ")["lag_us"])
-        print(f"node3 offset {before}us before, restored {restored}us; "
-              f"its first write reached node1 {lag}us after it was stamped")
         assert abs(restored - before) <= 1000, (before, restored)
-        assert lag > -10_000, f"write was stamped {-lag}us in node1's future"
 
         stamps = [r["hlc"] for r in sync_lines(node3)]
         assert all(a < b for a, b in zip(stamps, stamps[1:])), (
