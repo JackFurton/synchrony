@@ -161,6 +161,10 @@ pkgs.testers.runNixOSTest {
         ).strip())
 
 
+    def get(m, key):
+        return m.succeed(f"synchrony-get 127.0.0.1:${toString port} {key}").strip()
+
+
     def netem(m, dev, ms, first=False):
         verb = "add" if first else "change"
         m.succeed(f"tc qdisc {verb} dev {dev} root netem delay {ms}ms")
@@ -350,6 +354,10 @@ pkgs.testers.runNixOSTest {
 
         # The version was fixed when node3 accepted the write, not when source
         # finally got it, so the lag covers the whole outage.
+        # Read back from node3's own replica, not inferred from source's log.
+        assert get(node3, "clash") == "clash=source", get(node3, "clash")
+        assert get(node3, "outage49") == "outage49=v", get(node3, "outage49")
+
         lag = int(log_fields(node3, "applied key=outage0 ")["lag_us"])
         print(f"outage0 reached node3 {lag}us after node3 accepted it")
         assert lag > 5_000_000, f"lag {lag}us is shorter than the outage"
@@ -429,6 +437,8 @@ pkgs.testers.runNixOSTest {
         node3.wait_until_succeeds(
             "journalctl -u synchrony-node -o cat | grep -q 'keys=1051$'"
         )
+        for m in (source, *relays):
+            assert get(m, "k5") == "k5 deleted", f"{m.name}: {get(m, 'k5')}"
 
     # node3 holds k7 when node2 goes down. While it is cut off, source deletes
     # k7 and later collects the tombstone, so when node2 comes back there is
@@ -451,6 +461,8 @@ pkgs.testers.runNixOSTest {
         node3.wait_until_succeeds(
             "journalctl -u synchrony-node -o cat | grep -q 'keys=1050$'"
         )
+        assert get(node3, "k7") == "k7 missing", get(node3, "k7")
+        assert get(node3, "k8") == "k8=v", get(node3, "k8")
         assert count(node2, "refilling from scratch") == 0, (
             "node2 restarted empty and had nothing to wipe"
         )

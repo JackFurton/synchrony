@@ -14,6 +14,7 @@ add_library(synchrony-core
   src/store.cpp
   src/anti_entropy.cpp
   src/outbox.cpp
+  src/read.cpp
 )
 target_include_directories(synchrony-core PUBLIC src)
 target_compile_options(synchrony-core PRIVATE -Wall -Wextra -Wpedantic)
@@ -22,16 +23,20 @@ add_executable(synchrony-node src/main.cpp)
 target_link_libraries(synchrony-node PRIVATE synchrony-core)
 target_compile_options(synchrony-node PRIVATE -Wall -Wextra -Wpedantic)
 
+add_executable(synchrony-get src/get.cpp)
+target_link_libraries(synchrony-get PRIVATE synchrony-core)
+target_compile_options(synchrony-get PRIVATE -Wall -Wextra -Wpedantic)
+
 add_executable(synchrony-put src/put.cpp)
 target_link_libraries(synchrony-put PRIVATE synchrony-core)
 target_compile_options(synchrony-put PRIVATE -Wall -Wextra -Wpedantic)
 
 enable_testing()
-foreach(test wire peer clock hlc anti_entropy outbox)
+foreach(test wire peer clock hlc anti_entropy outbox read)
   add_executable(${test}_test tests/${test}_test.cpp)
   target_link_libraries(${test}_test PRIVATE synchrony-core)
   target_compile_options(${test}_test PRIVATE -Wall -Wextra -Wpedantic)
   add_test(NAME ${test} COMMAND ${test}_test)
 endforeach()
 
-install(TARGETS synchrony-node synchrony-put RUNTIME DESTINATION bin)
+install(TARGETS synchrony-node synchrony-put synchrony-get RUNTIME DESTINATION bin)

@@ -32,7 +32,7 @@ constexpr std::size_t kHeader = 20;  // everything after the length field
 
 bool known_type(std::uint8_t t) {
   return t >= static_cast<std::uint8_t>(MsgType::Hello) &&
-         t <= static_cast<std::uint8_t>(MsgType::Delete);
+         t <= static_cast<std::uint8_t>(MsgType::GetResp);
 }
 
 }  // namespace
@@ -115,6 +115,8 @@ const char* to_string(MsgType type) {
     case MsgType::LeafReq: return "leaf_req";
     case MsgType::LeafResp: return "leaf_resp";
     case MsgType::Delete: return "delete";
+    case MsgType::Get: return "get";
+    case MsgType::GetResp: return "get_resp";
   }
   return "unknown";
 }
