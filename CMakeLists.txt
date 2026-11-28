@@ -15,6 +15,7 @@ add_library(synchrony-core
   src/anti_entropy.cpp
   src/outbox.cpp
   src/read.cpp
+  src/state.cpp
 )
 target_include_directories(synchrony-core PUBLIC src)
 target_compile_options(synchrony-core PRIVATE -Wall -Wextra -Wpedantic)
@@ -32,7 +33,7 @@ target_link_libraries(synchrony-put PRIVATE synchrony-core)
 target_compile_options(synchrony-put PRIVATE -Wall -Wextra -Wpedantic)
 
 enable_testing()
-foreach(test wire peer clock hlc anti_entropy outbox read)
+foreach(test wire peer clock hlc anti_entropy outbox read state)
   add_executable(${test}_test tests/${test}_test.cpp)
   target_link_libraries(${test}_test PRIVATE synchrony-core)
   target_compile_options(${test}_test PRIVATE -Wall -Wextra -Wpedantic)

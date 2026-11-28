@@ -88,10 +88,12 @@ let
           (pkgs.lib.getExe synchrony)
           "--id ${config.networking.hostName}"
           "--listen ${toString port}"
+          "--state-dir /var/lib/synchrony"
         ] ++ (if upstream != null
           then [ "--upstream ${upstream}:${toString port}" ]
           else [ "--tombstone-ttl ${toString tombstoneTtl}" ]));
         Restart = "always";
+        StateDirectory = "synchrony";
         RestartSec = 1;
       };
     };
@@ -311,7 +313,7 @@ pkgs.testers.runNixOSTest {
   
     # node2 is node3's only way out. With it stopped, node3 has to keep taking
     # writes with nowhere to send them, then hand them over to a node2 that
-    # comes back with an empty store and an unsynced clock.
+    # comes back with an empty store, though with its clock restored.
     with subtest("node3 keeps its writes while node2 is down"):
         failed_dials = count(node3, "upstream dial failed")
         drained = count(node3, "landed key=.* outbox=0$")
@@ -465,6 +467,44 @@ pkgs.testers.runNixOSTest {
         assert get(node3, "k8") == "k8=v", get(node3, "k8")
         assert count(node2, "refilling from scratch") == 0, (
             "node2 restarted empty and had nothing to wipe"
+        )
+
+    # Every raw clock here is a few hundred ms ahead of source, so a node that
+    # came back on its raw clock would stamp writes in everyone else's future
+    # and beat writes made after them, until its first sync.
+    with subtest("a restarted node carries its clock across the restart"):
+        before = last_offset_us(node3)
+        node3.succeed("systemctl restart synchrony-node")
+        node3.wait_for_open_port(${toString port})
+        node3.succeed("synchrony-put 127.0.0.1:${toString port} after_restart=1")
+
+        # What matters is the stamp against the true time at the moment node3
+        # accepted the write. journald stamps the line with node3's raw clock,
+        # and node3's offset from before the restart turns that into source's
+        # time. Anything measured later, at source or node1, also includes the
+        # reconnect and anti-entropy delays, which hide a stamp hundreds of ms
+        # in the future.
+        line = node3.succeed(
+            "journalctl -u synchrony-node -o short-unix "
+            "| grep 'accepted key=after_restart ' | tail -1"
+        ).split()
+        secs, frac = line[0].split(".")
+        raw_us = int(secs) * 1_000_000 + int(frac.ljust(6, "0")[:6])
+        stamped_us = int(
+            next(f for f in line if f.startswith("version=")).split("=")[1]
+            .split(".")[0]
+        ) // 1000
+        skew = stamped_us - (raw_us + before)
+        print(f"node3 offset {before}us; its first write after the restart "
+              f"was stamped {skew}us off source's time")
+        assert abs(skew) < 5000, f"stamped {skew}us off source's time"
+
+        restored = int(log_fields(node3, "restored clock")["offset_us"])
+        assert abs(restored - before) <= 1000, (before, restored)
+
+        stamps = [r["hlc"] for r in sync_lines(node3)]
+        assert all(a < b for a, b in zip(stamps, stamps[1:])), (
+            "node3's hlc went backwards across the restart"
         )
   '';
 }
