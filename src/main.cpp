@@ -20,6 +20,7 @@
 #include "outbox.hpp"
 #include "peer.hpp"
 #include "read.hpp"
+#include "state.hpp"
 #include "store.hpp"
 #include "wire.hpp"
 
@@ -35,6 +36,10 @@ constexpr std::int64_t kConnectTimeoutNs = 3'000'000'000;
 constexpr std::int64_t kResendNs = 5'000'000'000;
 constexpr std::size_t kOutboxKeys = 10'000;
 constexpr std::int64_t kSecondNs = 1'000'000'000;
+// How far ahead of the last HLC sent the persisted floor is kept. Bigger means
+// fewer fsyncs; it is also the longest a restart can have to wait.
+constexpr std::int64_t kFloorLeaseNs = 250'000'000;
+constexpr std::int64_t kOffsetSlackNs = 1'000'000;
 constexpr int kPollTimeoutMs = 100;
 
 struct Config {
@@ -46,6 +51,7 @@ struct Config {
   // outbox and still be accepted, and the longest a replica can go without
   // catching up before it has to start over.
   std::int64_t tombstone_ttl_s = 600;
+  std::string state_dir;  // empty means the clock starts from nothing
 };
 
 void log(const Config& cfg, const std::string& msg) {
@@ -67,6 +73,8 @@ bool parse_args(int argc, char** argv, Config& cfg) {
       cfg.id = argv[++i];
     } else if (arg == "--listen" && has_value) {
       cfg.listen_port = static_cast<std::uint16_t>(std::atoi(argv[++i]));
+    } else if (arg == "--state-dir" && has_value) {
+      cfg.state_dir = argv[++i];
     } else if (arg == "--tombstone-ttl" && has_value) {
       cfg.tombstone_ttl_s = std::atoll(argv[++i]);
       if (cfg.tombstone_ttl_s <= 0) return false;
@@ -104,7 +112,8 @@ int main(int argc, char** argv) {
   if (!parse_args(argc, argv, cfg)) {
     std::fprintf(stderr,
                  "usage: synchrony-node --id NAME --listen PORT "
-                 "[--upstream HOST:PORT] [--tombstone-ttl SECONDS]\n");
+                 "[--upstream HOST:PORT] [--tombstone-ttl SECONDS] "
+                 "[--state-dir DIR]\n");
     return 2;
   }
 
@@ -140,6 +149,47 @@ int main(int argc, char** argv) {
     log(cfg, "no upstream, acting as source; clock is the reference");
   }
 
+  const std::string state_path =
+      cfg.state_dir.empty() ? "" : cfg.state_dir + "/clock";
+  sy::ClockState saved;
+  const bool restored = !state_path.empty() && sy::load_state(state_path, saved);
+  if (restored) {
+    clock.set_offset_ns(saved.offset_ns);
+    hlc.restore(saved.hlc_floor);
+    // Restarts are usually quicker than the lease, so the floor can still be
+    // ahead of real time. Waiting it out costs at most the lease and keeps
+    // the first stamps from claiming a time that has not happened yet.
+    while (clock.now() < saved.hlc_floor) ::usleep(1000);
+    log(cfg, "restored clock offset_us=" +
+                 std::to_string(saved.offset_ns / 1000) +
+                 " hlc_floor=" + std::to_string(saved.hlc_floor));
+  }
+
+  // A node that has never synced has nothing but its raw clock, which can be
+  // hundreds of milliseconds out, and would stamp writes with it.
+  bool clock_trusted = is_source || restored;
+
+  // Called before anything with an HLC stamp leaves this process. A stamp
+  // that never left cannot have been seen, so a crash before the save is
+  // harmless, and one after it restarts above everything that got out.
+  const auto keep_state = [&](std::int64_t wall) {
+    if (state_path.empty()) return;
+    const bool floor_reached = wall >= saved.hlc_floor;
+    const bool offset_moved =
+        std::llabs(clock.offset_ns() - saved.offset_ns) > kOffsetSlackNs;
+    if (!floor_reached && !offset_moved) return;
+
+    sy::ClockState next{clock.offset_ns(), floor_reached
+                                               ? wall + kFloorLeaseNs
+                                               : saved.hlc_floor};
+    if (sy::save_state(state_path, next)) {
+      saved = next;
+    } else {
+      log(cfg, "saving clock state to " + state_path +
+                   " failed: " + std::strerror(errno));
+    }
+  };
+
   const auto drop = [&](int fd, const char* why) {
     log(cfg, std::string("dropping peer: ") + why);
     ::close(fd);
@@ -155,6 +205,7 @@ int main(int argc, char** argv) {
   const auto send_to = [&](int fd, const sy::Message& msg) {
     const auto it = peers.find(fd);
     if (it == peers.end()) return;
+    keep_state(msg.hlc.wall);
     if (!it->second.queue(sy::encode(msg))) {
       log(cfg, "buffer full, dropped " + describe(msg));
       return;
@@ -501,6 +552,7 @@ int main(int argc, char** argv) {
           const std::int64_t offset =
               sy::cristian_offset(pending.t1, upstream_time, t4);
           clock.set_offset_ns(offset);
+          clock_trusted = true;
           pending.active = false;
 
           // A lower offset moves this node's clock backwards. Measure how far,
@@ -561,6 +613,10 @@ int main(int argc, char** argv) {
             continue;
           }
 
+          if (from_client && !clock_trusted) {
+            log(cfg, "clock has never synced, refusing write key=" + key);
+            continue;
+          }
           if (from_client) {
             if (!outbox.add(key, e)) {
               log(cfg, "outbox full, refusing write key=" + key);

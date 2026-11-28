@@ -33,6 +33,10 @@ class HlcClock {
 
   const Hlc& last() const { return last_; }
 
+  // After a restart: nothing issued from here on sorts before floor, which
+  // has to be above anything the previous run let out.
+  void restore(std::int64_t floor) { last_ = {floor, 0}; }
+
  private:
   Hlc last_;
 };

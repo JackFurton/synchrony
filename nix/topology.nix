@@ -88,10 +88,12 @@ let
           (pkgs.lib.getExe synchrony)
           "--id ${config.networking.hostName}"
           "--listen ${toString port}"
+          "--state-dir /var/lib/synchrony"
         ] ++ (if upstream != null
           then [ "--upstream ${upstream}:${toString port}" ]
           else [ "--tombstone-ttl ${toString tombstoneTtl}" ]));
         Restart = "always";
+        StateDirectory = "synchrony";
         RestartSec = 1;
       };
     };
@@ -311,7 +313,7 @@ pkgs.testers.runNixOSTest {
   
     # node2 is node3's only way out. With it stopped, node3 has to keep taking
     # writes with nowhere to send them, then hand them over to a node2 that
-    # comes back with an empty store and an unsynced clock.
+    # comes back with an empty store, though with its clock restored.
     with subtest("node3 keeps its writes while node2 is down"):
         failed_dials = count(node3, "upstream dial failed")
         drained = count(node3, "landed key=.* outbox=0$")
@@ -465,6 +467,30 @@ pkgs.testers.runNixOSTest {
         assert get(node3, "k8") == "k8=v", get(node3, "k8")
         assert count(node2, "refilling from scratch") == 0, (
             "node2 restarted empty and had nothing to wipe"
+        )
+
+    # Every raw clock here is a few hundred ms ahead of source, so a node that
+    # came back on its raw clock would stamp writes in everyone else's future
+    # and beat writes made after them, until its first sync.
+    with subtest("a restarted node carries its clock across the restart"):
+        before = last_offset_us(node3)
+        node3.succeed("systemctl restart synchrony-node")
+        node3.succeed("synchrony-put 127.0.0.1:${toString port} after_restart=1")
+        node1.wait_until_succeeds(
+            "journalctl -u synchrony-node -o cat "
+            "| grep -q 'applied key=after_restart '"
+        )
+
+        restored = int(log_fields(node3, "restored clock")["offset_us"])
+        lag = int(log_fields(node1, "applied key=after_restart ")["lag_us"])
+        print(f"node3 offset {before}us before, restored {restored}us; "
+              f"its first write reached node1 {lag}us after it was stamped")
+        assert abs(restored - before) <= 1000, (before, restored)
+        assert lag > -10_000, f"write was stamped {-lag}us in node1's future"
+
+        stamps = [r["hlc"] for r in sync_lines(node3)]
+        assert all(a < b for a, b in zip(stamps, stamps[1:])), (
+            "node3's hlc went backwards across the restart"
         )
   '';
 }
