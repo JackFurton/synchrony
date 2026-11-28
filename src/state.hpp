@@ -21,8 +21,16 @@ struct ClockState {
 // False if there is no state yet, or it is unreadable.
 bool load_state(const std::string& path, ClockState& out);
 
-// Replaces the file atomically and fsyncs it, so a crash leaves either the
-// old state or the new one.
+// Replaces the file atomically, so a crash leaves either the old state or the
+// new one.
+//
+// Deliberately no fsync. It runs on the event loop just before a stamped
+// message goes out, and a fsync landing inside a clock sync's round trip makes
+// one leg look longer than the other, which Cristian's algorithm cannot tell
+// from real asymmetry: it moved node3's estimate by 6.8ms in the VM test. So
+// this survives the process dying, which is what restarts are, but not the
+// machine. After a reboot the restored offset still puts the clock right; the
+// floor is the backstop that might be a few seconds stale.
 bool save_state(const std::string& path, const ClockState& s);
 
 }  // namespace sy

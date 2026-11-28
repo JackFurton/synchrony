@@ -29,25 +29,14 @@ bool save_state(const std::string& path, const ClockState& s) {
   char buf[64];
   const int len = std::snprintf(buf, sizeof(buf), "%" PRId64 " %" PRId64 "\n",
                                 s.offset_ns, s.hlc_floor);
-  if (::write(fd, buf, static_cast<std::size_t>(len)) != len ||
-      ::fsync(fd) != 0) {
+  if (::write(fd, buf, static_cast<std::size_t>(len)) != len) {
     const int saved = errno;
     ::close(fd);
     errno = saved;
     return false;
   }
   ::close(fd);
-  if (::rename(tmp.c_str(), path.c_str()) != 0) return false;
-
-  // The rename is only durable once the directory entry is.
-  const auto slash = path.rfind('/');
-  const std::string dir = slash == std::string::npos ? "." : path.substr(0, slash);
-  const int dfd = ::open(dir.c_str(), O_RDONLY);
-  if (dfd >= 0) {
-    ::fsync(dfd);
-    ::close(dfd);
-  }
-  return true;
+  return ::rename(tmp.c_str(), path.c_str()) == 0;
 }
 
 }  // namespace sy
